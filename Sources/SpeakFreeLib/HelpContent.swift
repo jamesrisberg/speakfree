@@ -212,7 +212,9 @@ public enum HelpContent {
             .bullet("If no text field is focused, the transcription goes to your clipboard "
                     + "instead, so nothing is lost. Just paste it."),
             .bullet("A recording banner appears while you speak. It shows the microphone level, "
-                    + "so you can tell speakfree is hearing you."),
+                    + "so you can tell speakfree is hearing you. Settings → General → Indicator "
+                    + "moves it to the bottom of the screen or under the notch, or hides it; the "
+                    + "menu bar icon always shows when you are recording."),
             .bullet("The first dictation after launch can be a moment slower while the model "
                     + "loads. After that it is fast."),
             .bullet("When speakfree can see where your cursor is, it adds a leading space if it "

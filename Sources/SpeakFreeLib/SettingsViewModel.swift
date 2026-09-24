@@ -20,6 +20,7 @@ public class SettingsViewModel: ObservableObject {
     @Published public var punctuationMode: PunctuationMode
     @Published public var maxRecordings: Int
     @Published public var screenContext: Bool
+    @Published public var overlayPlacement: OverlayPlacement
     @Published public var preBuffer: Bool
     @Published public var keepModelLoaded: String
     @Published public var diagnosticLogging: Bool
@@ -60,6 +61,7 @@ public class SettingsViewModel: ObservableObject {
         self.punctuationMode = c.effectivePunctuationMode
         self.maxRecordings = c.preserveAllRecordings?.value == true ? 0 : (c.maxRecordings ?? 0)
         self.screenContext = c.screenContext?.value ?? false
+        self.overlayPlacement = c.effectiveOverlayPlacement
         self.preBuffer = c.preBuffer?.value ?? true
         self.keepModelLoaded = c.keepModelLoaded ?? "auto"
         let isBeta = Bundle.main.bundleIdentifier?.hasSuffix(".beta") == true
@@ -95,6 +97,7 @@ public class SettingsViewModel: ObservableObject {
         self.punctuationMode = c.effectivePunctuationMode
         self.maxRecordings = c.preserveAllRecordings?.value == true ? 0 : (c.maxRecordings ?? 0)
         self.screenContext = c.screenContext?.value ?? false
+        self.overlayPlacement = c.effectiveOverlayPlacement
         self.preBuffer = c.preBuffer?.value ?? true
         self.keepModelLoaded = c.keepModelLoaded ?? "auto"
         let isBeta = Bundle.main.bundleIdentifier?.hasSuffix(".beta") == true
@@ -137,6 +140,7 @@ public class SettingsViewModel: ObservableObject {
         config.keyMode = keyMode
         config.toggleMode = FlexBool(keyMode == .toggle)
         config.screenContext = FlexBool(screenContext)
+        config.overlayPosition = overlayPlacement
         config.preBuffer = FlexBool(preBuffer)
         config.keepModelLoaded = keepModelLoaded
         config.diagnosticLogging = FlexBool(diagnosticLogging)

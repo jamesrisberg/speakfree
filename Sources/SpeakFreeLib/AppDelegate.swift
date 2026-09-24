@@ -1640,6 +1640,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusBar.state = .recording
         recordingOverlay.style = min(5, max(1, config.overlayStyle ?? 5))
+        recordingOverlay.placement = config.effectiveOverlayPlacement
         recordingOverlay.show(state: .recording, recorder: recorder)
         let overlayFinishedAt = CFAbsoluteTimeGetCurrent()
         startRecordingWatchdog()

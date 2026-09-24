@@ -738,6 +738,27 @@ struct SettingsView: View {
                             }
 
                             GridRow(alignment: .firstTextBaseline) {
+                                Text("Indicator")
+                                    .frame(width: labelWidth, alignment: .leading)
+                                    .gridColumnAlignment(.leading)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Picker("Indicator", selection: $viewModel.overlayPlacement) {
+                                        ForEach(OverlayPlacement.allCases, id: \.self) { placement in
+                                            Text(placement.label).tag(placement)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .labelsHidden()
+                                    .frame(width: 200, alignment: .leading)
+                                    .onChange(of: viewModel.overlayPlacement) { _ in viewModel.save() }
+                                    Text(viewModel.overlayPlacement.detail)
+                                        .font(.footnote)
+                                        .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+
+                            GridRow(alignment: .firstTextBaseline) {
                                 Text(RecordingRetention.label)
                                     .frame(width: labelWidth, alignment: .leading)
                                     .gridColumnAlignment(.leading)
