@@ -263,7 +263,17 @@ case "notice-preview":
 case "overlay-preview":
     // Dev-only: loop the recording overlay's entry animation against simulated
     // speech, so the sequence can be judged without dictating. Mic untouched.
-    RecordingOverlayPreview.run(style: args.count > 2 ? (Int(args[2]) ?? 5) : 5)
+    // A style number previews the banner's content view; a placement name drives
+    // the real overlay window at that position (config overlayPosition).
+    let arg = args.count > 2 ? args[2] : "5"
+    if let style = Int(arg) {
+        RecordingOverlayPreview.run(style: style)
+    } else if let placement = OverlayPlacement.parse(arg) {
+        RecordingOverlayPreview.runPlacement(placement, screenIndex: args.count > 3 ? Int(args[3]) : nil)
+    } else {
+        print("Usage: speakfree overlay-preview <1-5 | center|bottom|notch|hidden> [screen]")
+        exit(1)
+    }
 case "--help", "-h", "help":
     printUsage()
 case nil:
