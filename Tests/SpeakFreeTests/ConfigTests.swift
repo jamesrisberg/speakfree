@@ -80,6 +80,21 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.modelSize, "base.en")
     }
 
+    func testLocalAPIAllowControlDefaultsOffAndDecodes() throws {
+        let absent = try Config.decode(from: """
+        {"hotkey": {"keyCode": 63, "modifiers": []}, "modelSize": "base.en", "language": "en",
+         "localAPI": true}
+        """.data(using: .utf8)!)
+        XCTAssertNil(absent.localAPIAllowControl, "Enabling the API must not imply dictation control")
+        XCTAssertFalse(absent.localAPIAllowControl?.value ?? false)
+
+        let enabled = try Config.decode(from: """
+        {"hotkey": {"keyCode": 63, "modifiers": []}, "modelSize": "base.en", "language": "en",
+         "localAPI": true, "localAPIAllowControl": "true"}
+        """.data(using: .utf8)!)
+        XCTAssertEqual(enabled.localAPIAllowControl?.value, true)
+    }
+
     func testConfigDecodesWithoutMaxRecordings() throws {
         let json = """
         {

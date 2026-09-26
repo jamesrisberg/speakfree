@@ -53,6 +53,10 @@ public struct Config: Codable {
     // Experimental local API hardening. The server is loopback-only regardless of these.
     public var localAPIAllowBrowser: FlexBool?  // nil = false — gate any CORS (Access-Control-*) headers
     public var localAPIToken: String?           // nil = no auth — when set, require "Authorization: Bearer <token>"
+    // Dictation control endpoints (/v1/dictation/*, /v1/events) let a sibling app start, stop,
+    // and observe dictation. Gated SEPARATELY from transcription: a client that may transcribe
+    // files must not also be able to turn the microphone on unless the user opted in.
+    public var localAPIAllowControl: FlexBool?  // nil = false
 
     // Recordings privacy (Michael, 2026-07-14): persisting dictation audio + transcript
     // sidecars is OPT-IN. nil/false = nothing persists — the wav is deleted once the
