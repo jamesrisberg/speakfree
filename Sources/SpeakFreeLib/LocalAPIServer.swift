@@ -6,6 +6,11 @@ import AVFoundation
 /// Minimal loopback-only HTTP server exposing POST /v1/audio/transcriptions.
 /// Compatible with OpenAI-format clients. EXPERIMENTAL — for local integrations only.
 ///
+/// When `localAPIAllowControl` is also on, the same server (same loopback, Host, and token rules)
+/// exposes dictation control for sibling apps: POST /v1/dictation/start, POST
+/// /v1/dictation/{id}/stop|cancel, GET /v1/dictation/{id}, and a GET /v1/events SSE stream.
+/// See DictationControl.swift for the session state machine.
+///
 /// Hardening (audit T1.1):
 ///  - Loopback enforced two ways: connections from a non-loopback remote endpoint are
 ///    cancelled before any bytes are read (primary), and the listener requests the
@@ -55,6 +60,8 @@ final class LocalAPIServer {
     // Hardening config, captured at start().
     private var allowBrowser = false
     private var authToken: String?
+    private var allowControl = false
+    private weak var control: DictationControlCenter?
 
     // Concurrent-connection cap (audit AR-1). Mutated only on `serverQueue` (the listener's
     // newConnectionHandler queue) and decremented from the same queue, so no extra locking.
@@ -69,7 +76,8 @@ final class LocalAPIServer {
 
     // MARK: - Lifecycle
 
-    func start(transcriber: Transcriber, allowBrowser: Bool = false, authToken: String? = nil) {
+    func start(transcriber: Transcriber, allowBrowser: Bool = false, authToken: String? = nil,
+               allowControl: Bool = false, control: DictationControlCenter? = nil) {
         stop()
         // NW-A: the server just started, so nothing is in flight. Sweep any temp audio left
         // behind in tmp/api by a crash/kill during a previous transcription (the per-request
@@ -77,6 +85,8 @@ final class LocalAPIServer {
         Self.sweepTmpAPI()
         self.transcriber = transcriber
         self.allowBrowser = allowBrowser
+        self.allowControl = allowControl
+        self.control = control
         // Treat empty/whitespace token as "no auth".
         let trimmed = authToken?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.authToken = (trimmed?.isEmpty == false) ? trimmed : nil
@@ -357,11 +367,23 @@ final class LocalAPIServer {
     enum RequestOutcome: Equatable {
         case respond(status: Int, body: String, contentType: String)
         case transcribe(fileData: Data, format: String)
+        case control(ControlRequest)
+    }
+
+    /// A parsed, authorized dictation-control request (only produced when control is allowed).
+    enum ControlRequest: Equatable {
+        case start(destination: DictationAPIDestination, engine: String?, timeoutMs: Int?)
+        case stop(UUID)
+        case cancel(UUID)
+        case state(UUID)
+        case events
     }
 
     /// Decide the outcome of a request from its already-parsed header string and body.
     /// `authToken` nil => no auth required; non-nil => require matching bearer token.
-    static func evaluate(headers: String, body: Data, authToken: String?) -> RequestOutcome {
+    /// `allowControl` false => the dictation-control routes answer 403 (transcription unaffected).
+    static func evaluate(headers: String, body: Data, authToken: String?,
+                         allowControl: Bool = false) -> RequestOutcome {
         let lines = headers.components(separatedBy: "\r\n")
         guard let requestLine = lines.first else {
             return .respond(status: 400, body: #"{"error":"Bad request"}"#, contentType: "application/json")
@@ -394,6 +416,16 @@ final class LocalAPIServer {
             }
         }
 
+        let route = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+        if route == "/v1/events" || route == "/v1/dictation" || route.hasPrefix("/v1/dictation/") {
+            guard allowControl else {
+                return .respond(status: 403,
+                                body: #"{"error":"Dictation control is disabled (enable localAPIAllowControl)"}"#,
+                                contentType: "application/json")
+            }
+            return evaluateControl(method: method, route: route, body: body)
+        }
+
         guard method == "POST", path.hasPrefix("/v1/audio/transcriptions") else {
             return .respond(status: 404,
                             body: #"{"error":"POST /v1/audio/transcriptions"}"#,
@@ -421,6 +453,68 @@ final class LocalAPIServer {
 
         let responseFormat = fields["response_format"].flatMap { String(data: $0, encoding: .utf8) } ?? "json"
         return .transcribe(fileData: fileData, format: responseFormat)
+    }
+
+    /// Route an already-authorized dictation-control request. Pure, like `evaluate`.
+    static func evaluateControl(method: String, route: String, body: Data) -> RequestOutcome {
+        func error(_ status: Int, _ message: String) -> RequestOutcome {
+            .respond(status: status, body: DictationControlCenter.json(["error": message]),
+                     contentType: "application/json")
+        }
+        if route == "/v1/events" {
+            return method == "GET" ? .control(.events) : error(405, "Use GET /v1/events")
+        }
+        let parts = route.split(separator: "/").map(String.init)  // ["v1", "dictation", ...]
+        if parts.count == 3, parts[2] == "start" {
+            guard method == "POST" else { return error(405, "Use POST /v1/dictation/start") }
+            var obj: [String: Any] = [:]
+            if !body.isEmpty {
+                guard let parsed = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+                    return error(400, "Body must be a JSON object")
+                }
+                obj = parsed
+            }
+            let destination: DictationAPIDestination
+            switch obj["destination"] {
+            case nil: destination = .caller
+            case let raw as String:
+                guard let d = DictationAPIDestination(rawValue: raw) else {
+                    return error(400, "destination must be \"caller\" or \"cursor\"")
+                }
+                destination = d
+            default: return error(400, "destination must be \"caller\" or \"cursor\"")
+            }
+            var engine: String?
+            if let e = obj["engine"] {
+                guard let s = e as? String, !s.isEmpty else { return error(400, "engine must be a string") }
+                engine = s
+            }
+            var timeoutMs: Int?
+            if let t = obj["timeout_ms"] {
+                // JSONSerialization yields NSNumber for both ints and bools; reject bools and fractions.
+                guard let n = t as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
+                      n.doubleValue == n.doubleValue.rounded(), n.intValue > 0,
+                      n.intValue <= DictationControlCenter.maxTimeoutMs else {
+                    return error(400, "timeout_ms must be an integer from 1 to \(DictationControlCenter.maxTimeoutMs)")
+                }
+                timeoutMs = n.intValue
+            }
+            return .control(.start(destination: destination, engine: engine, timeoutMs: timeoutMs))
+        }
+        guard parts.count >= 3, parts.count <= 4, let id = UUID(uuidString: parts[2]) else {
+            return error(404, "Unknown dictation route")
+        }
+        if parts.count == 3 {
+            return method == "GET" ? .control(.state(id)) : error(405, "Use GET /v1/dictation/{id}")
+        }
+        switch parts[3] {
+        case "stop":
+            return method == "POST" ? .control(.stop(id)) : error(405, "Use POST /v1/dictation/{id}/stop")
+        case "cancel":
+            return method == "POST" ? .control(.cancel(id)) : error(405, "Use POST /v1/dictation/{id}/cancel")
+        default:
+            return error(404, "Unknown dictation route")
+        }
     }
 
     /// Case-insensitive `Authorization: Bearer <token>` match.
@@ -453,12 +547,99 @@ final class LocalAPIServer {
         // browser's same-origin policy blocks it from reading the response.
         let allowedOrigin = corsOrigin(forHeaders: headers)
 
-        switch Self.evaluate(headers: headers, body: body, authToken: authToken) {
+        switch Self.evaluate(headers: headers, body: body, authToken: authToken, allowControl: allowControl) {
         case .respond(let status, let respBody, let ct):
             send(conn, status: status, body: respBody, contentType: ct, allowOrigin: allowedOrigin)
         case .transcribe(let fileData, let format):
             transcribeData(fileData, format: format, conn: conn, allowOrigin: allowedOrigin)
+        case .control(let request):
+            // The control center is main-thread only (it drives AppDelegate's recording path).
+            DispatchQueue.main.async { [weak self] in
+                self?.handleControl(request, conn: conn, allowOrigin: allowedOrigin)
+            }
         }
+    }
+
+    // MARK: - Dictation control
+
+    private func handleControl(_ request: ControlRequest, conn: NWConnection, allowOrigin: String?) {
+        func reply(_ status: Int, _ body: String) {
+            send(conn, status: status, body: body, allowOrigin: allowOrigin)
+        }
+        func fail(_ error: DictationControlCenter.ControlError) {
+            let (status, message): (Int, String)
+            switch error {
+            case .notReady: (status, message) = (503, "Dictation is not ready")
+            case .busy: (status, message) = (409, "A dictation is already in progress")
+            case .engineMismatch(let active):
+                (status, message) = (422, "Per-session engine switching is not supported; active engine is \(active)")
+            case .notFound: (status, message) = (404, "Unknown dictation session")
+            case .startFailed(let reason): (status, message) = (503, reason)
+            case .invalidTransition(let phase): (status, message) = (409, "Cannot cancel a session that is \(phase.rawValue)")
+            }
+            reply(status, DictationControlCenter.json(["error": message]))
+        }
+        guard let control = control else {
+            reply(503, #"{"error":"Dictation control is not available"}"#); return
+        }
+        switch request {
+        case .start(let destination, let engine, let timeoutMs):
+            switch control.start(destination: destination, engine: engine, timeoutMs: timeoutMs) {
+            case .success(let session): reply(200, DictationControlCenter.sessionJSON(session))
+            case .failure(let e): fail(e)
+            }
+        case .stop(let id):
+            // Long-poll: answer once the take is transcribed (or failed/cancelled).
+            if let e = control.stop(id: id, completion: { session in
+                reply(200, DictationControlCenter.sessionJSON(session))
+            }) { fail(e) }
+        case .cancel(let id):
+            switch control.cancel(id: id) {
+            case .success(let session): reply(200, DictationControlCenter.sessionJSON(session))
+            case .failure(let e): fail(e)
+            }
+        case .state(let id):
+            if let session = control.session(id: id) {
+                reply(200, DictationControlCenter.sessionJSON(session))
+            } else { fail(.notFound) }
+        case .events:
+            openEventStream(conn, control: control, allowOrigin: allowOrigin)
+        }
+    }
+
+    /// Hold the connection open as a Server-Sent Events stream. It occupies one connection slot
+    /// until the client disconnects (or a write fails); the read caps were already cancelled once
+    /// the request was parsed, so a long-lived stream is not cut by the 120 s lifetime timer.
+    private func openEventStream(_ conn: NWConnection, control: DictationControlCenter, allowOrigin: String?) {
+        var headerLines = [
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/event-stream; charset=utf-8",
+            "Cache-Control: no-cache",
+            "Connection: keep-alive",
+        ]
+        headerLines += corsHeaderLines(allowOrigin)
+        conn.send(content: (headerLines.joined(separator: "\r\n") + "\r\n\r\n").data(using: .utf8)!,
+                  completion: .contentProcessed { _ in })
+
+        var token: UUID?
+        let close: () -> Void = { [weak control] in
+            DispatchQueue.main.async {
+                if let t = token { control?.unsubscribe(t); token = nil }
+                conn.cancel()
+            }
+        }
+        token = control.subscribe { frame in
+            conn.send(content: frame.data(using: .utf8), completion: .contentProcessed { error in
+                if error != nil { close() }
+            })
+        }
+        // Any further read ending (client closed, reset) tears the stream down.
+        func watch() {
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 1_024) { _, _, isComplete, error in
+                if isComplete || error != nil { close() } else { watch() }
+            }
+        }
+        watch()
     }
 
     /// The value to put in `Access-Control-Allow-Origin`, or nil to emit no CORS headers.
@@ -720,9 +901,13 @@ final class LocalAPIServer {
         case 204: statusText = "No Content"
         case 400: statusText = "Bad Request"
         case 401: statusText = "Unauthorized"
+        case 403: statusText = "Forbidden"
         case 404: statusText = "Not Found"
+        case 405: statusText = "Method Not Allowed"
+        case 409: statusText = "Conflict"
         case 413: statusText = "Payload Too Large"
         case 421: statusText = "Misdirected Request"
+        case 422: statusText = "Unprocessable Content"
         case 429: statusText = "Too Many Requests"
         case 500: statusText = "Internal Server Error"
         case 503: statusText = "Service Unavailable"
@@ -739,12 +924,7 @@ final class LocalAPIServer {
         // corsOrigin(forHeaders:)). We reflect exactly that origin and send Vary: Origin so
         // intermediaries don't cache the response under the wrong origin. A cross-origin page
         // (rebound evil.com) gets no ACAO header and therefore cannot read the response.
-        if let origin = allowOrigin {
-            headerLines.append("Access-Control-Allow-Origin: \(origin)")
-            headerLines.append("Vary: Origin")
-            headerLines.append("Access-Control-Allow-Methods: POST, OPTIONS")
-            headerLines.append("Access-Control-Allow-Headers: Content-Type, Authorization")
-        }
+        headerLines += corsHeaderLines(allowOrigin)
         if status == 401 {
             headerLines.append("WWW-Authenticate: Bearer")
         }
@@ -755,6 +935,16 @@ final class LocalAPIServer {
         var response = header.data(using: .utf8)!
         response.append(bodyData)
         conn.send(content: response, completion: .contentProcessed { _ in conn.cancel() })
+    }
+
+    private func corsHeaderLines(_ allowOrigin: String?) -> [String] {
+        guard let origin = allowOrigin else { return [] }
+        return [
+            "Access-Control-Allow-Origin: \(origin)",
+            "Vary: Origin",
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers: Content-Type, Authorization",
+        ]
     }
 
     private static func jsonEscape(_ s: String) -> String {
