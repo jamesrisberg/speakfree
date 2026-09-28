@@ -2,6 +2,14 @@ import AppKit
 import XCTest
 @testable import SpeakFreeLib
 
+/// Records which threads a closure ran on; written off main by the session's finalize work.
+private final class ThreadLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var onMain: [Bool] = []
+    func record() { lock.lock(); onMain.append(Thread.isMainThread); lock.unlock() }
+    var values: [Bool] { lock.lock(); defer { lock.unlock() }; return onMain }
+}
+
 private final class SessionTestCapture: DeviceCapturing {
     var deliver: ((CapturePacket) -> Void)?
     func start(device: AudioInputDevice, packet: @escaping (CapturePacket) -> Void,
@@ -24,6 +32,7 @@ final class DictationSessionTests: XCTestCase {
     private var session: DictationSession!
     private var events: [DictationEvent] = []
     private var microphoneAllowed = true
+    private let retentionLoads = ThreadLog()
 
     private let spokenText = "hello from the session test"
 
@@ -59,6 +68,11 @@ final class DictationSessionTests: XCTestCase {
         environment.frontmostApplication = { nil }
         environment.readCursorContext = { _ in (nil, nil) }
         environment.captureScreenText = { nil }
+        let retentionLoads = retentionLoads
+        environment.loadRetentionConfig = {
+            retentionLoads.record()
+            return Config.load()
+        }
         session = DictationSession(recorder: recorder, inserter: inserter, environment: environment)
         session.transcriber = Transcriber(engine: engine, modelID: "base.en", language: "en")
         session.engineID = "whisper"
@@ -171,6 +185,71 @@ final class DictationSessionTests: XCTestCase {
         XCTAssertFalse(session.retarget(to: .caller), "the destination is fixed once finalize began")
     }
 
+    func testTranscriptPipelineAndStoreRunOffMain() async throws {
+        _ = try start(.caller)
+        speak()
+        _ = try await session.stop()
+        XCTAssertEqual(retentionLoads.values, [false],
+                       "text pipeline, retention and RecordingStore work must not block main")
+    }
+
+    // MARK: - Observers and the post-buffer
+
+    func testObserverCanRetargetOnRelease() async throws {
+        var retargeted: Bool?
+        session.addObserver { [weak self] _, event in
+            if event == .released { retargeted = self?.session.retarget(to: .caller) }
+        }
+        _ = try start(.cursor)
+        speak()
+        let result = try await session.stop()
+        XCTAssertEqual(retargeted, true)
+        XCTAssertEqual(result.delivery, .returnedToCaller)
+        XCTAssertTrue(inserted.isEmpty)
+    }
+
+    func testObserverCanCancelOnRelease() async throws {
+        session.addObserver { [weak self] _, event in
+            if event == .released { XCTAssertEqual(self?.session.cancel(), true) }
+        }
+        _ = try start(.cursor)
+        speak()
+        do {
+            _ = try await session.stop()
+            XCTFail("the take was cancelled on release")
+        } catch {
+            XCTAssertEqual(error as? DictationFailure, .cancelled)
+        }
+        XCTAssertFalse(session.isCapturing)
+        XCTAssertNil(recorder.stopRecording(), "no recording may be left open")
+    }
+
+    func testStartFromCaptureEndedObserverIsRefused() async throws {
+        var nested: DictationStartOutcome?
+        session.addObserver { [weak self] _, event in
+            if event == .captureEnded { nested = self?.session.start(destination: .caller) }
+        }
+        _ = try start(.cursor)
+        speak()
+        let result = try await session.stop()
+        XCTAssertEqual(nested, .refused(.busy), "finalize owns the take until its snapshots are taken")
+        XCTAssertEqual(result.delivery, .inserted)
+        XCTAssertFalse(session.isCapturing)
+    }
+
+    func testRetargetDuringPostBuffer() async throws {
+        _ = try start(.cursor)
+        speak()
+        let done = expectation(description: "finished")
+        var outcome: Result<DictationResult, DictationFailure>?
+        session.stopRecording { outcome = $0; done.fulfill() }
+        XCTAssertTrue(session.isTrailing)
+        XCTAssertTrue(session.retarget(to: .caller))
+        await fulfillment(of: [done], timeout: 5)
+        XCTAssertEqual(try outcome?.get().delivery, .returnedToCaller)
+        XCTAssertTrue(inserted.isEmpty)
+    }
+
     // MARK: - Start preconditions
 
     func testStartIsRefusedWhileDisabled() {
@@ -269,6 +348,46 @@ final class DictationSessionTests: XCTestCase {
         XCTAssertEqual(try center.cancel(id: apiSession.id).get().phase, .cancelled)
         XCTAssertFalse(session.isCapturing)
         XCTAssertTrue(inserted.isEmpty)
+    }
+
+    func testControlCenterCancelDuringPostBufferDiscardsTheTake() throws {
+        let center = DictationControlCenter()
+        center.attach(to: session)
+        let apiSession = try center.start(destination: .cursor, engine: nil, timeoutMs: nil).get()
+        speak()
+        var stopped: DictationAPISession?
+        XCTAssertNil(center.stop(id: apiSession.id) { stopped = $0 })
+        XCTAssertTrue(session.isTrailing)
+        XCTAssertEqual(try center.cancel(id: apiSession.id).get().phase, .cancelled)
+        XCTAssertEqual(stopped?.phase, .cancelled)
+        XCTAssertFalse(session.isCapturing)
+        XCTAssertNil(recorder.stopRecording())
+
+        let settle = expectation(description: "no late finalize")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { settle.fulfill() }
+        wait(for: [settle], timeout: 3)
+        XCTAssertTrue(inserted.isEmpty, "a cancelled take must never be typed")
+        XCTAssertFalse(events.contains(.transcribing))
+    }
+
+    func testControlCenterHearsAFailureBeforeLaterObservers() throws {
+        let center = DictationControlCenter()
+        center.attach(to: session)
+        var phaseSeenByHost: DictationPhase?
+        var apiID: UUID?
+        session.addObserver { _, event in
+            // The host observer is added after the center, as SpeakFree's app does: by the time
+            // it could show a modal alert, the API caller's session has already settled.
+            if case .failed = event, let apiID { phaseSeenByHost = center.session(id: apiID)?.phase }
+        }
+        let apiSession = try center.start(destination: .caller, engine: nil, timeoutMs: nil).get()
+        apiID = apiSession.id
+        capture.deliver?(CapturePacket(start: 0, samples: Array(repeating: 0.2, count: 800)))
+        recorder.capture.queue.sync {}
+        let done = expectation(description: "stop answers")
+        XCTAssertNil(center.stop(id: apiSession.id) { _ in done.fulfill() })
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(phaseSeenByHost, .error)
     }
 
     func testControlCenterReportsTheSessionEngine() {

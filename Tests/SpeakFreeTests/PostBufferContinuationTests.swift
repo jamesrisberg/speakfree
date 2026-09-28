@@ -1,3 +1,5 @@
+// ai-suggestion:unverified · session:01a09da8-0424-7b71-a705-10868c5f46e4 · 2026-09-13
+
 import XCTest
 @testable import SpeakFreeLib
 

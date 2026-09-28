@@ -198,6 +198,8 @@ public final class DictationSession {
         var readCursorContext: (CursorContextRequest) -> (AXUIElement?, String?) = CursorContextCapture.read
         /// Runs off main.
         var captureScreenText: () -> String? = { ScreenContext.captureAndRecognize() }
+        /// The saved settings a finished take's retention follows. Runs off main.
+        var loadRetentionConfig: () -> Config = { Config.load() }
     }
 
     public let recorder: AudioRecorder
@@ -242,6 +244,9 @@ public final class DictationSession {
     private var recordingTargetBundleID: String?
     /// The current press resumed a take whose previous hold had already been released.
     private var continuedReleasedTake = false
+    /// True while finalize takes its snapshots (focus, OCR, transcriber, configuration); a new
+    /// take cannot start from an observer in that window and steal them.
+    private var isFinalizing = false
 
     // MARK: Edit Mode seams (nil = hold/toggle behavior)
 
@@ -336,6 +341,11 @@ public final class DictationSession {
     // MARK: - Observation
 
     /// Observers run on main, in the order they were added. Returns a token for `removeObserver`.
+    ///
+    /// An observer may call back into the session: `retarget` and `cancel` work from
+    /// `released`, and `start` is refused with `.busy` while finalize is taking its snapshots
+    /// (from `captureEnded` until `transcribing` or the take's failure). Anything slow or modal
+    /// belongs after the event returns, since later observers and the take wait for it.
     @discardableResult
     public func addObserver(_ observer: @escaping Observer) -> UUID {
         let token = UUID()
@@ -366,14 +376,15 @@ public final class DictationSession {
     @discardableResult
     public func start(destination: DictationDestination, takeID: UUID = UUID()) -> DictationStartOutcome {
         guard isEnabled else { return .refused(.notReady) }
-        guard !isRecording else { return .refused(.busy) }
+        guard !isRecording, !isFinalizing else { return .refused(.busy) }
         if let timer = postBufferTimer, let resumedID = currentTakeID {
             // Capture is still running during the post-buffer. Continue this take without
             // creating another WAV/sentinel or replacing the original insertion context.
             postBufferGeneration &+= 1
             timer.invalidate()
-            postBufferTimer = nil
+            // Recording before trailing clears, so an off-main reader never sees neither.
             setRecording(true)
+            postBufferTimer = nil
             continuedReleasedTake = true
             startRecordingWatchdog()
             startStreamingTimer()
@@ -517,17 +528,15 @@ public final class DictationSession {
             stopWaiters[takeID, default: []].append(completion)
         }
         guard isRecording, let takeID = currentTakeID else { return }
-        setRecording(false)
         continuedReleasedTake = false
 
         stopRecordingWatchdog()
         stopStreamingTimer()
         stopLevelEvents()
 
-        // Capture key-release time NOW — finalizeRecording runs up to the post-buffer later, so
-        // measuring inside it would undercount the post-buffer delay in the latency log.
+        // Capture key-release time NOW — finalizeRecording runs only after the post-buffer (up to
+        // 1.2 s later), so measuring inside it would undercount the delay in the latency log.
         let keyReleaseTime = CFAbsoluteTimeGetCurrent()
-        emit(takeID, .released)
 
         // T2.1 — Adaptive post-buffer. We still keep recording AFTER key release so the tail of
         // the last word (an AVAudioEngine buffer releasing mid-word loses its tail) isn't clipped.
@@ -537,6 +546,10 @@ public final class DictationSession {
         runAdaptivePostBuffer(samplesAtRelease: samplesAtRelease) { [weak self] in
             self?.finalizeRecording(keyReleaseTime: keyReleaseTime)
         }
+        // Trailing is set before recording clears, so an off-main reader never sees neither.
+        setRecording(false)
+        // Reported once the take is trailing, so an observer can retarget or cancel it here.
+        emit(takeID, .released)
     }
 
     /// End the press and wait for the take's text.
@@ -798,18 +811,21 @@ public final class DictationSession {
         recordingActivityLease = nil
         // Retain on every synchronous early-return path, then transfer into Task below.
         defer { withExtendedLifetime(activityLease) {} }
+        isFinalizing = true
+        defer { isFinalizing = false }
         let takeID = currentTakeID ?? UUID()
-        // The host applies settings it deferred during capture here, before the transcriber and
-        // configuration snapshots below, so the whole finalization runs on ONE engine.
-        emit(takeID, .captureEnded)
-
         let stopTime = keyReleaseTime
         let destination = currentDestination ?? .cursor
         currentTakeID = nil
         currentDestination = nil
+        let stoppedRecording = recorder.stopRecording()
+        // Capture is over. The host applies settings it deferred during capture here, before the
+        // transcriber and configuration snapshots below, so the whole finalization runs on ONE
+        // engine.
+        emit(takeID, .captureEnded)
         let configuration = self.configuration
 
-        guard let recording = recorder.stopRecording() else {
+        guard let recording = stoppedRecording else {
             if let activityLease {
                 RecordingStore.clearSentinel(recordingURL: activityLease.audioURL)
             }
@@ -958,12 +974,17 @@ public final class DictationSession {
             keyReleaseAt: keyReleaseTime
         ))
 
-        // Bridge into async: the transcribe pipeline is async/await (FluidAudio is async-only;
-        // WhisperEngine exposes async shims). The engines serialize access to their own context
-        // internally. Results are marshalled back to main via DispatchQueue.main.async.
-        Task { [weak self, activityLease] in
+        // Bridge into async, OFF main: transcription, the text pipeline (spell checker,
+        // glossary), the retention settings read and RecordingStore (whose mutation lock a
+        // recordings purge holds for its whole run) must never block main. Everything the work
+        // reads was snapshotted above; events and delivery hop back to main.
+        let loadRetentionConfig = environment.loadRetentionConfig
+        Task.detached(priority: .userInitiated) { [weak self, activityLease] in
             defer { activityLease?.release() }
             guard let self = self else { return }
+            func onMain(_ body: @escaping @MainActor () -> Void) {
+                DispatchQueue.main.async { MainActor.assumeIsolated(body) }
+            }
             do {
                 // Build Whisper prompt + run post-processing through the shared TextPipeline
                 // core, the same code path unit tests cover.
@@ -991,7 +1012,7 @@ public final class DictationSession {
                 if !transcriber.isLoaded {
                     DiagnosticLogger.shared.log(
                         "Finalize: dictation waiting on model load (cold start)")
-                    DispatchQueue.main.async {
+                    onMain {
                         self.emit(takeID, .modelLoading)
                     }
                 }
@@ -1022,7 +1043,7 @@ public final class DictationSession {
                     targetApp: metaTargetApp,
                     transcriptionDiagnostics: transcriber.lastDiagnostics
                 )
-                let retentionConfig = Config.load()
+                let retentionConfig = loadRetentionConfig()
                 let keepRecording = DevMode.effectiveSaveRecordings(retentionConfig)
                 let maxRecordings = (DevMode.isActive || !keepRecording || retentionConfig.preserveAllRecordings?.value == true)
                     ? 0 : Config.effectiveMaxRecordings(retentionConfig.maxRecordings)
@@ -1047,20 +1068,20 @@ public final class DictationSession {
                     let payload = EditFinalizePayload(
                         sessionID: sessionID, segmentID: segmentID, raw: primaryRaw,
                         pipelineText: text, audioURL: audioURL, meta: meta)
-                    DispatchQueue.main.async {
+                    onMain {
                         // No TextInserter, no focus recapture — the session owns the segment from here.
                         self.editFinalizeSink?(payload)
                         self.emit(takeID, .finished(result(.editSession)))
                     }
                 case .returnToCaller:
-                    DispatchQueue.main.async {
+                    onMain {
                         // No TextInserter: the text goes back to the caller and never reaches
                         // the focused app.
                         self.emit(takeID, .delivering(.caller))
                         self.emit(takeID, .finished(result(.returnedToCaller)))
                     }
                 case .insertImmediately:
-                    DispatchQueue.main.async {
+                    onMain {
                         self.emit(takeID, .delivering(.cursor))
                         let delivery = self.deliverAtCursor(
                             text,
@@ -1079,7 +1100,7 @@ public final class DictationSession {
                 // The opt-out must win on the failure path too: finishRecording(keep:false)
                 // — the deletion the user consented to — is never reached when inference
                 // throws, and the wav would silently persist against the setting.
-                let retentionConfig = Config.load()
+                let retentionConfig = loadRetentionConfig()
                 let keepRecording = DevMode.effectiveSaveRecordings(retentionConfig)
                 let maxRecordings = (DevMode.isActive || !keepRecording || retentionConfig.preserveAllRecordings?.value == true)
                     ? 0 : Config.effectiveMaxRecordings(retentionConfig.maxRecordings)
@@ -1105,7 +1126,7 @@ public final class DictationSession {
                     failure = .transcriptionFailed(reason: error.localizedDescription,
                                                    recordingKept: keepRecording)
                 }
-                DispatchQueue.main.async {
+                onMain {
                     self.emit(takeID, .failed(failure))
                 }
             }
@@ -1233,8 +1254,9 @@ public final class DictationSession {
                     prompt: nil,
                     suppressRegex: suppressRegex,
                     onPartialResult: { [weak self] text in
-                        // Engines call back on their own queue; the assembler is main-only.
-                        DispatchQueue.main.async {
+                        // WhisperEngine delivers partials on main; the assembler is main-only,
+                        // so any engine that calls back elsewhere is hopped over.
+                        let show: @MainActor () -> Void = {
                             guard let self = self, self.streamingGeneration == generation else { return }
                             // Strip Whisper hallucination markers so they don't appear in the
                             // live preview — the finalize path goes through TextPipeline, but
@@ -1242,22 +1264,26 @@ public final class DictationSession {
                             let cleaned = TextPipeline.stripWhisperBracketMarkers(text)
                             self.emit(takeID, .partialText(self.streamingAssembler.append(cleaned)))
                         }
+                        if Thread.isMainThread {
+                            MainActor.assumeIsolated(show)
+                        } else {
+                            DispatchQueue.main.async { MainActor.assumeIsolated(show) }
+                        }
                     }
                 )
                 DispatchQueue.main.async {
+                    self.isStreamingInFlight = false
+                    // A stop that already bumped the generation must not have its (now-stale)
+                    // partial shown after the release or revived for reuse.
+                    guard self.streamingGeneration == generation else { return }
                     // Commit completed sentences so they won't change on next inference.
                     // Must run on main: streamingAssembler is main-queue-only state.
                     self.emit(takeID, .partialText(self.streamingAssembler.append(partial)))
-                    self.isStreamingInFlight = false
                     // T2.3 — record THIS completed pass (raw partial + samples it saw + when it
                     // finished) so a fast key-release can reuse it instead of a fresh final pass.
-                    // Guard on generation: a stop that already bumped the generation must not have
-                    // its (now-stale) partial revived by a late-arriving completion.
-                    if self.streamingGeneration == generation {
-                        self.lastStreamingRawPartial = partial
-                        self.lastStreamingSampleCount = streamedSampleCount
-                        self.lastStreamingCompletedAt = CFAbsoluteTimeGetCurrent()
-                    }
+                    self.lastStreamingRawPartial = partial
+                    self.lastStreamingSampleCount = streamedSampleCount
+                    self.lastStreamingCompletedAt = CFAbsoluteTimeGetCurrent()
                 }
             } catch {
                 DiagnosticLogger.shared.log("Streaming: chunk failed — \(error.localizedDescription)")

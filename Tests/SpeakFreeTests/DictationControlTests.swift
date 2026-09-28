@@ -3,11 +3,12 @@ import XCTest
 
 /// Local API dictation control: the session state machine, the caller destination, and the SSE
 /// framing. The recording pipeline is a stub driver that reports back through the same
-/// `pipeline…` hooks AppDelegate calls, so no microphone, model, or AppKit is involved.
+/// `pipeline…` hooks a `DictationSession`'s events drive, so no microphone, model, or AppKit is
+/// involved. DictationSessionTests covers the center driving a real session.
 @MainActor
 final class DictationControlTests: XCTestCase {
 
-    /// Stands in for AppDelegate: records calls and lets each test script the pipeline's reports.
+    /// Stands in for the session: records calls and lets each test script the pipeline's reports.
     final class StubDriver: DictationDriver {
         weak var center: DictationControlCenter?
         var isDictating = false

@@ -29,7 +29,8 @@ protocol DictationDriver: AnyObject {
     /// Current input level, 0...1.
     var inputLevel: Float { get }
     /// Start recording for an API session. Returns nil once recording started, else a reason.
-    /// The driver must report the outcome through the control center's `pipeline…` hooks.
+    /// The take's progress reaches the control center's `pipeline…` hooks (for a session,
+    /// through `attach(to:)`).
     func startAPIDictation(sessionID: UUID, destination: DictationDestination) -> String?
     /// Stop capture and finalize (same path as releasing the hotkey).
     func stopAPIDictation()

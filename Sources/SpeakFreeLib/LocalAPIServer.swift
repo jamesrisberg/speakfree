@@ -611,6 +611,7 @@ final class LocalAPIServer {
     /// Hold the connection open as a Server-Sent Events stream. It occupies one connection slot
     /// until the client disconnects (or a write fails); the read caps were already cancelled once
     /// the request was parsed, so a long-lived stream is not cut by the 120 s lifetime timer.
+    @MainActor
     private func openEventStream(_ conn: NWConnection, control: DictationControlCenter, allowOrigin: String?) {
         var headerLines = [
             "HTTP/1.1 200 OK",
@@ -629,21 +630,20 @@ final class LocalAPIServer {
                 conn.cancel()
             }
         }
-        // Called from handleControl on the main actor.
-        MainActor.assumeIsolated {
-            token = control.subscribe { frame in
-                conn.send(content: frame.data(using: .utf8), completion: .contentProcessed { error in
-                    if error != nil { close() }
-                })
-            }
+        token = control.subscribe { frame in
+            conn.send(content: frame.data(using: .utf8), completion: .contentProcessed { error in
+                if error != nil { close() }
+            })
         }
-        // Any further read ending (client closed, reset) tears the stream down.
-        func watch() {
-            conn.receive(minimumIncompleteLength: 1, maximumLength: 1_024) { _, _, isComplete, error in
-                if isComplete || error != nil { close() } else { watch() }
-            }
+        Self.closeOnReadEnd(conn, close: close)
+    }
+
+    /// Any further read ending (client closed, reset) tears the stream down. Runs on the
+    /// connection's queue, off the main actor.
+    private nonisolated static func closeOnReadEnd(_ conn: NWConnection, close: @escaping () -> Void) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1_024) { _, _, isComplete, error in
+            if isComplete || error != nil { close() } else { closeOnReadEnd(conn, close: close) }
         }
-        watch()
     }
 
     /// The value to put in `Access-Control-Allow-Origin`, or nil to emit no CORS headers.
