@@ -18,9 +18,9 @@ final class LocalAPIServerLiveTests: XCTestCase {
 
     /// Ephemeral per-run port (audit 2026-07-01 M0.5). The old fixed 57650 flaked:
     /// a not-yet-released socket from a prior or concurrent run blocked the bind and
-    /// `startServer`'s lsof wait spun until the suite failed (seen in the M1 report).
-    /// A random high port per process makes collisions vanishingly unlikely; the
-    /// lsof probe in `startServer` still verifies the listener actually came up.
+    /// `startServer`'s readiness wait spun until the suite failed (seen in the M1 report).
+    /// A random high port per process makes collisions vanishingly unlikely; `startServer`
+    /// still waits for `LocalAPIServer`'s own `onReady` callback before returning.
     private static let livePort: UInt16 = .random(in: 49500...64000)
 
     override func setUp() {
@@ -31,7 +31,16 @@ final class LocalAPIServerLiveTests: XCTestCase {
     }
 
     override func tearDown() {
-        server?.stop()
+        if let server {
+            // All 15 cases in this class share one ephemeral port (see `livePort` above).
+            // `stop()` cancels the listener asynchronously, so without waiting for the
+            // `.cancelled` state the next case's `start()` can race the still-releasing
+            // socket on the same port and its own readiness wait times out (seen under
+            // full-suite load as "Asynchronous wait failed... unfulfilled: listener ready").
+            let cancelled = expectation(description: "listener cancelled")
+            server.stop { cancelled.fulfill() }
+            wait(for: [cancelled], timeout: 3)
+        }
         server = nil
         transcriber = nil
         super.tearDown()
@@ -88,18 +97,24 @@ final class LocalAPIServerLiveTests: XCTestCase {
         return ip.isEmpty ? nil : ip
     }
 
+    /// Waits for `LocalAPIServer`'s own `onReady` callback (fired from its `NWListener`
+    /// `.ready` state) rather than polling `lsof` or sleeping a guessed duration — either of
+    /// those undershoots on a loaded machine, since `NWListener.start(queue:)` returns before
+    /// the bind/listen actually lands, letting a test connect before the socket is really
+    /// there ("curl: (7) Failed to connect" / HTTP "000" under full-suite load).
+    private func waitForReady(_ start: (@escaping () -> Void) -> Void, timeout: TimeInterval = 5) {
+        let ready = expectation(description: "listener ready")
+        start { ready.fulfill() }
+        wait(for: [ready], timeout: timeout)
+    }
+
     private func startServer(allowBrowser: Bool = false, token: String? = nil) {
         let t = makeTranscriber()
         self.transcriber = t
         let s = LocalAPIServer(port: Self.livePort)
-        s.start(transcriber: t, allowBrowser: allowBrowser, authToken: token)
         self.server = s
-        // Give the listener a moment to bind.
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            let (out, _) = shell("/usr/sbin/lsof", ["-iTCP:\(Self.livePort)", "-sTCP:LISTEN", "-P", "-n"])
-            if out.contains("\(Self.livePort)") { break }
-            usleep(50_000)
+        waitForReady { onReady in
+            s.start(transcriber: t, allowBrowser: allowBrowser, authToken: token, onReady: onReady)
         }
     }
 
@@ -181,18 +196,14 @@ final class LocalAPIServerLiveTests: XCTestCase {
         // Simulate: config.localAPI == true  →  syncLocalAPIServerState() calls server.start()
         let t = makeTranscriber()
         let s = LocalAPIServer(port: Self.livePort)
-        s.start(transcriber: t, allowBrowser: false, authToken: nil)
         self.server = s   // tearDown will stop it
-
-        // Wait up to 3 s for the listener to bind.
-        let deadline = Date().addingTimeInterval(3)
-        var lsofOut = ""
-        while Date() < deadline {
-            let (out, _) = shell("/usr/sbin/lsof", ["-iTCP:\(Self.livePort)", "-sTCP:LISTEN", "-P", "-n"])
-            lsofOut = out
-            if out.contains("\(Self.livePort)") { break }
-            usleep(50_000)
+        waitForReady { onReady in
+            s.start(transcriber: t, allowBrowser: false, authToken: nil, onReady: onReady)
         }
+
+        // The listener is ready now (proven above); take one lsof snapshot as the T1.2
+        // acceptance evidence that the bind is externally observable, not just internally.
+        let (lsofOut, _) = shell("/usr/sbin/lsof", ["-iTCP:\(Self.livePort)", "-sTCP:LISTEN", "-P", "-n"])
         print("PROOF[T1.2-enabled] lsof -iTCP:\(Self.livePort) -sTCP:LISTEN =>\n\(lsofOut)")
         XCTAssertTrue(lsofOut.contains("\(Self.livePort)"),
                       "Server should be LISTEN after start() — launch path: server not found in lsof:\n\(lsofOut)")
@@ -371,15 +382,9 @@ final class LocalAPIServerLiveTests: XCTestCase {
         let t = makeTranscriber()
         let s = LocalAPIServer(port: Self.livePort)
         s.connectionLifetimeOverride = 2.0
-        s.start(transcriber: t)
         self.server = s
-
-        // Wait for the listener to bind.
-        let bindDeadline = Date().addingTimeInterval(3)
-        while Date() < bindDeadline {
-            let (out, _) = shell("/usr/sbin/lsof", ["-iTCP:\(Self.livePort)", "-sTCP:LISTEN", "-P", "-n"])
-            if out.contains("\(Self.livePort)") { break }
-            usleep(50_000)
+        waitForReady { onReady in
+            s.start(transcriber: t, onReady: onReady)
         }
 
         // Python script: opens a connection, then trickles 1 byte per second forever.
@@ -463,15 +468,9 @@ final class LocalAPIServerLiveTests: XCTestCase {
         self.transcriber = slow
         let s = LocalAPIServer(port: Self.livePort)
         s.connectionLifetimeOverride = 2.0
-        s.start(transcriber: slow)
         self.server = s
-
-        // Wait for the listener to bind.
-        let bindDeadline = Date().addingTimeInterval(3)
-        while Date() < bindDeadline {
-            let (out, _) = shell("/usr/sbin/lsof", ["-iTCP:\(Self.livePort)", "-sTCP:LISTEN", "-P", "-n"])
-            if out.contains("\(Self.livePort)") { break }
-            usleep(50_000)
+        waitForReady { onReady in
+            s.start(transcriber: slow, onReady: onReady)
         }
 
         // Write the fixture to a scratch file for curl -F (multipart) upload.
@@ -561,22 +560,24 @@ final class LocalAPIServerLiveTests: XCTestCase {
         let t = makeTranscriber()
         transcriber = t
         let s = LocalAPIServer(port: Self.livePort)
-        s.start(transcriber: t, allowControl: true, control: center)
         server = s
+        waitForReady { onReady in
+            s.start(transcriber: t, allowControl: true, control: center, onReady: onReady)
+        }
         let base = "http://127.0.0.1:\(Self.livePort)"
 
         let eventsDone = expectation(description: "events stream")
         var events = ""
-        // Give the listener a moment, then open the stream for ~1.5 s.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            self.curlAsync(["-s", "-N", "--max-time", "1.5", "\(base)/v1/events"]) {
-                events = $0; eventsDone.fulfill()
-            }
+        // The listener is already confirmed ready (waitForReady above); open the stream for
+        // ~1.5 s right away — the POST /start below still waits a beat so curl has time to
+        // actually connect before it fires, so the stream catches the full state sequence.
+        curlAsync(["-s", "-N", "--max-time", "1.5", "\(base)/v1/events"]) {
+            events = $0; eventsDone.fulfill()
         }
 
         let stopped = expectation(description: "stop returns text")
         var stopBody = ""
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.curlAsync(["-s", "--max-time", "3", "-X", "POST", "-d", #"{"destination":"caller"}"#,
                             "\(base)/v1/dictation/start"]) { startBody in
                 guard let obj = try? JSONSerialization.jsonObject(with: Data(startBody.utf8)) as? [String: Any],

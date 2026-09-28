@@ -105,8 +105,9 @@ class HotkeyManager {
         // A stopped manager can never deliver a pending release: force-end an in-flight
         // take rather than strand it. Unconditional — no hardware read — because whatever
         // the key state, no future event will arrive through this instance. Config
-        // reloads are deferred past an in-flight take (AppDelegate L1), but `isPressed`
-        // (main thread) lags `modifierPressed` (tap thread) by one main-queue hop, so a
+        // reloads are deferred past an in-flight take (AppDelegate L1), but
+        // `DictationSession.isRecording` (main thread) lags `modifierPressed` (tap thread) by
+        // one main-queue hop, so a
         // press landing inside a reload or the post-buffer window can still reach here
         // pressed: the queue becomes [onKeyDown][forced keyUp] — a zero-length take, the
         // deliberate trade against the old behavior (a silently stranded one). At app
@@ -568,8 +569,8 @@ class HotkeyManager {
         //     that needs pressed-state tracking plus a keyState-based hardware read for regular
         //     keycodes — separate work. (3) `modifierPressed` is an unsynchronized Bool with
         //     tap-thread and main-thread writers, so two racing reconcile paths can both dispatch
-        //     onKeyUp; the user-visible double-stop is prevented by `guard isPressed` in
-        //     AppDelegate.handleRecordingStop, not by anything in this file.
+        //     onKeyUp; the user-visible double-stop is prevented by `guard isRecording` in
+        //     DictationSession.stopRecording, not by anything in this file.
         //
         // Worst case if a release is missed and no reconcile path fires, walked in both modes:
         // in HOLD mode the next release is honored normally and the take ends one tap later. In
