@@ -4,6 +4,10 @@ import PackageDescription
 let package = Package(
     name: "speakfree",
     platforms: [.macOS(.v14)],
+    products: [
+        // The dictation engine and its session API, for hosts that embed dictation.
+        .library(name: "SpeakFreeLib", targets: ["SpeakFreeLib"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0"),
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.1"),
