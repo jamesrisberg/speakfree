@@ -3,7 +3,7 @@ import AppKit
 import Foundation
 import CoreGraphics
 
-class HotkeyManager {
+public class HotkeyManager {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var eventTapRunLoop: CFRunLoop?
@@ -29,7 +29,7 @@ class HotkeyManager {
     /// Track tap creation retries after TCC propagation delay
     private var tapRetryCount = 0
 
-    init(keyCode: UInt16, modifiers: UInt64 = 0) {
+    public init(keyCode: UInt16, modifiers: UInt64 = 0) {
         self.keyCode = keyCode
         self.requiredModifiers = modifiers
     }
@@ -39,13 +39,22 @@ class HotkeyManager {
     /// releases. With it the raw callbacks keep firing and `onIntent` receives the
     /// recognizer's output for the same presses, so a consumer that drives dictation from
     /// intents passes no-op raw handlers.
-    struct Gestures {
-        var mode: KeyGestureRecognizer.Mode
-        var configuration: KeyGestureRecognizer.Configuration
+    public struct Gestures {
+        public var mode: KeyGestureRecognizer.Mode
+        public var configuration: KeyGestureRecognizer.Configuration
         /// Read on the main thread before each event.
-        var isSessionActive: () -> Bool
+        public var isSessionActive: () -> Bool
         /// Called on the main thread.
-        var onIntent: (KeyGestureRecognizer.Intent) -> Void
+        public var onIntent: (KeyGestureRecognizer.Intent) -> Void
+
+        public init(mode: KeyGestureRecognizer.Mode, configuration: KeyGestureRecognizer.Configuration,
+                    isSessionActive: @escaping () -> Bool,
+                    onIntent: @escaping (KeyGestureRecognizer.Intent) -> Void) {
+            self.mode = mode
+            self.configuration = configuration
+            self.isSessionActive = isSessionActive
+            self.onIntent = onIntent
+        }
     }
 
     /// Monotonic clock for gesture timing, read when an event arrives. A test seam.
@@ -56,7 +65,7 @@ class HotkeyManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    func start(
+    public func start(
         onKeyDown: @escaping () -> Void,
         onKeyUp: @escaping () -> Void,
         onAbort: (() -> Void)? = nil,
@@ -101,7 +110,7 @@ class HotkeyManager {
         gestureDriver?.keyUp(at: time)
     }
 
-    func stop() {
+    public func stop() {
         // A stopped manager can never deliver a pending release: force-end an in-flight
         // take rather than strand it. Unconditional — no hardware read — because whatever
         // the key state, no future event will arrive through this instance. Config
@@ -713,7 +722,7 @@ class HotkeyManager {
 
     /// A conservative edit model for the remembered cursor tail used by AX-opaque apps.
     /// Printable typing can extend the known tail; destructive or cursor-moving input drops it.
-    enum CursorInteraction: Equatable {
+    public enum CursorInteraction: Equatable {
         case text(String)
         case backspace
         case newline
