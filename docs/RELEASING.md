@@ -276,7 +276,7 @@ auto-update for users on old public keys until they manually reinstall.
 | `FATAL: extracted Sparkle signature looks invalid` | `sign_update` failed or no private key in keychain | Run `sign_update <dmg>` manually; check keychain for the EdDSA private key |
 | `notarytool submit` fails with "The credentials provided are not valid" | Profile stale or wrong team | Re-run `notarytool store-credentials` (§5b) |
 | `codesign: no identity found` | Developer ID cert missing from keychain | Re-import certificate (§5a) |
-| `FATAL: libwhisper still points to …` | `install_name_tool` failed | Check that `otool` is from the Xcode Command Line Tools, not a stale path |
+| `FATAL: speakfree links a whisper/ggml or Homebrew dylib` | `Package.swift` or the modulemap links whisper dynamically again | Link whisper only through the `whisper` binary target (`scripts/vendor/whisper.xcframework`) |
 | `build.sh: Sparkle cask not installed` | Sparkle cask removed or never installed | `brew install --cask sparkle` |
 | Sparkle cask deprecated warning | Cask `sparkle` is flagged as deprecated in brew | The cask is only used for its `sign_update` binary; the deprecation does not affect the release binary. If the cask is removed, copy `sign_update`/`generate_keys` from a known-good version or download directly from the [Sparkle GitHub releases](https://github.com/sparkle-project/Sparkle/releases). |
 

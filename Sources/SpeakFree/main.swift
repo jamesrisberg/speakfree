@@ -47,6 +47,7 @@ func cmdStart() {
     app.setActivationPolicy(.accessory)
 
     let delegate = AppDelegate()
+    delegate.updater = SparkleUpdater()
     app.delegate = delegate
 
     // Signal handler only sets the flag — no heap allocation, locks, or Obj-C calls.

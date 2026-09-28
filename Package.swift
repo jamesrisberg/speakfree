@@ -13,17 +13,25 @@ let package = Package(
         .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.1"),
     ],
     targets: [
-        // C module wrapping whisper.cpp headers — links against the bundled dylib
+        // whisper.cpp 1.8.3 + ggml 0.9.5 as one static library for macOS arm64, built by
+        // scripts/vendor/build-whisper-xcframework.sh. Linked statically, so nothing from
+        // Homebrew is on the link line and no whisper dylib has to be shipped beside a host.
+        .binaryTarget(
+            name: "whisper",
+            path: "scripts/vendor/whisper.xcframework"
+        ),
+        // C module wrapping the whisper.cpp headers that match the static library above.
         .target(
             name: "CWhisper",
+            dependencies: ["whisper"],
             path: "Sources/CWhisper",
             publicHeadersPath: "include",
             linkerSettings: [
-                .unsafeFlags([
-                    "-L/opt/homebrew/lib",
-                    "-lwhisper",
-                    "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",
-                ]),
+                .linkedLibrary("c++"),
+                .linkedFramework("Accelerate"),
+                .linkedFramework("Foundation"),
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
             ]
         ),
         // Tiny Objective-C bridge so Swift can catch NSException from AVAudioEngine
@@ -36,7 +44,6 @@ let package = Package(
         .target(
             name: "SpeakFreeLib",
             dependencies: [
-                "Sparkle",
                 "CWhisper",
                 "CTryCatch",
                 .product(name: "FluidAudio", package: "FluidAudio"),
@@ -50,7 +57,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "speakfree",
-            dependencies: ["SpeakFreeLib"],
+            dependencies: [
+                "SpeakFreeLib",
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
             path: "Sources/SpeakFree"
         ),
         // Performance-regression harness (T2.0): benchmarks per-fixture inference time +

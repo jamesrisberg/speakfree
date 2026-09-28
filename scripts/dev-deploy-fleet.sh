@@ -18,29 +18,18 @@ sf_initialize_stage() {
 }
 
 sf_build_and_vendor() {
-    local app="$SF_STAGE_ROOT/speakfree-fleet.app" dylib real_dylib b s orig final dev_id
+    local app="$SF_STAGE_ROOT/speakfree-fleet.app" links dev_id
     echo "== build and vendor =="
     xcrun swift build -c release || return 1
     bash scripts/bundle-app.sh .build/release/speakfree "$app" dev || return 1
-    for dylib in scripts/vendor/dylibs/*.dylib; do cp "$dylib" "$app/Contents/Frameworks/" || return 1; done
-    for real_dylib in "$app/Contents/Frameworks"/*.dylib; do
-        b=$(basename "$real_dylib")
-        s=$(echo "$b" | sed 's/\([^0-9]*[0-9]*\)\.[0-9]*\.[0-9]*\.dylib$/\1.dylib/')
-        if [ "$s" != "$b" ]; then ln -sf "$b" "$app/Contents/Frameworks/$s" || return 1; fi
-    done
-    orig=$(otool -L "$app/Contents/MacOS/speakfree" | awk '/libwhisper\.1\.dylib/ {print $1; exit}')
-    [ -n "$orig" ] || { echo "FATAL: libwhisper dependency not found" >&2; return 1; }
-    if [ "$orig" != "@rpath/libwhisper.1.dylib" ]; then
-        install_name_tool -change "$orig" "@rpath/libwhisper.1.dylib" "$app/Contents/MacOS/speakfree" || return 1
+    # whisper.cpp is linked statically; the binary must not load a whisper/ggml or Homebrew dylib.
+    links=$(otool -L "$app/Contents/MacOS/speakfree" | tail -n +2) || return 1
+    if grep -Eq 'libwhisper|libggml|/opt/homebrew|/usr/local/' <<< "$links"; then
+        echo "FATAL: speakfree links a whisper/ggml or Homebrew dylib" >&2; return 1
     fi
-    final=$(otool -L "$app/Contents/MacOS/speakfree" | awk '/libwhisper\.1\.dylib/ {print $1; exit}')
-    [ "$final" = "@rpath/libwhisper.1.dylib" ] || { echo "FATAL: rpath fix failed" >&2; return 1; }
     dev_id=$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
     [ -n "$dev_id" ] || dev_id=-
-    for real_dylib in "$app/Contents/Frameworks"/*.dylib; do
-        [ -L "$real_dylib" ] || codesign --force --sign "$dev_id" "$real_dylib" || return 1
-    done
     codesign --force --sign "$dev_id" "$app/Contents/Frameworks/Sparkle.framework" || return 1
     codesign --force --sign "$dev_id" --identifier com.definitelyreal.speakfree "$app" || return 1
     cp scripts/guarded-install.sh "$SF_STAGE_ROOT/guarded-install.sh" || return 1

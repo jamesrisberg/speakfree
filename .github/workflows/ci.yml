@@ -27,10 +27,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install whisper-cpp
-        if: github.event_name == 'push' || steps.filter.outputs.swift == 'true'
-        run: brew install whisper-cpp
-
       - name: Build
         if: github.event_name == 'push' || steps.filter.outputs.swift == 'true'
         run: swift build -c release
