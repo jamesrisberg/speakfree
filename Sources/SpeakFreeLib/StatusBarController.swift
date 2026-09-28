@@ -60,6 +60,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
     var modelLoadMessage: String? { didSet { buildMenu() } }
+    /// Offers "Check for Updates..." when set; the app injects its Sparkle updater.
+    var updater: AppUpdater? { didSet { buildMenu() } }
 
     enum State: Equatable {
         case idle
@@ -368,10 +370,10 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Check for Updates — wired to Sparkle's updater
-        if let delegate = NSApplication.shared.delegate as? AppDelegate {
+        // Check for Updates — wired to the injected updater (Sparkle in the app)
+        if let updater {
             let updateTarget = MenuItemTarget {
-                delegate.updaterController.checkForUpdates(nil)
+                updater.checkForUpdates()
             }
             menuItemTargets.append(updateTarget)
             let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(MenuItemTarget.invoke), keyEquivalent: "")
