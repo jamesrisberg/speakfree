@@ -517,6 +517,10 @@ public enum HelpContent {
                  + "transcription endpoint on localhost, so your own scripts and any compatible "
                  + "client can use speakfree's engine. It refuses any connection that is not from "
                  + "this Mac, and fails closed if it cannot tell."),
+            .row("Dictation Control", "Off by default, and only available with the API on. Lets "
+                 + "an app on this Mac start and stop dictation and receive the text back instead "
+                 + "of having it typed, and follow recording state as it happens. Same local-only "
+                 + "rules and optional token as the transcription endpoint."),
             .action("Open Settings", .openSettings),
         ])
     }

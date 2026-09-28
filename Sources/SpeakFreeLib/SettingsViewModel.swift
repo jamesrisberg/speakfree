@@ -30,6 +30,7 @@ public class SettingsViewModel: ObservableObject {
     @Published public var parakeetModel: String
     @Published public var localAPIEnabled: Bool
     @Published public var localAPIPort: Int
+    @Published public var localAPIAllowControl: Bool
     @Published public var saveRecordings: Bool
     @Published public var saveError: String?
 
@@ -77,6 +78,7 @@ public class SettingsViewModel: ObservableObject {
         self.parakeetModel = c.parakeetModel ?? "parakeet-tdt-0.6b-v3"
         self.localAPIEnabled = c.localAPI?.value ?? false
         self.localAPIPort = c.localAPIPort ?? 5765
+        self.localAPIAllowControl = c.localAPIAllowControl?.value ?? false
         self.saveRecordings = c.saveRecordings?.value ?? false
     }
 
@@ -113,6 +115,7 @@ public class SettingsViewModel: ObservableObject {
         self.parakeetModel = c.parakeetModel ?? "parakeet-tdt-0.6b-v3"
         self.localAPIEnabled = c.localAPI?.value ?? false
         self.localAPIPort = c.localAPIPort ?? 5765
+        self.localAPIAllowControl = c.localAPIAllowControl?.value ?? false
         self.saveRecordings = c.saveRecordings?.value ?? false
     }
 
@@ -150,6 +153,7 @@ public class SettingsViewModel: ObservableObject {
         config.parakeetModel = parakeetModel
         config.localAPI = FlexBool(localAPIEnabled)
         config.localAPIPort = localAPIPort
+        config.localAPIAllowControl = FlexBool(localAPIAllowControl)
         config.saveRecordings = FlexBool(saveRecordings)
         return config
     }

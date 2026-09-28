@@ -1230,9 +1230,17 @@ struct SettingsView: View {
     // MARK: - Local API Row
 
     private var localAPIRow: some View {
-        checkboxRow("Local Transcription API", selection: $viewModel.localAPIEnabled,
-                    detail: "Experimental: lets other apps on this Mac request transcription.\nPOST http://localhost:\(viewModel.localAPIPort)/v1/audio/transcriptions")
-                .onChange(of: viewModel.localAPIEnabled) { _ in viewModel.save() }
+        VStack(alignment: .leading, spacing: 10) {
+            checkboxRow("Local Transcription API", selection: $viewModel.localAPIEnabled,
+                        detail: "Experimental: lets other apps on this Mac request transcription.\nPOST http://localhost:\(viewModel.localAPIPort)/v1/audio/transcriptions")
+                    .onChange(of: viewModel.localAPIEnabled) { _ in viewModel.save() }
+            // Separate opt-in: starting dictation turns the microphone on, which file
+            // transcription never does.
+            checkboxRow("Dictation Control", selection: $viewModel.localAPIAllowControl,
+                        detail: "Experimental: lets other apps on this Mac start and stop dictation and receive the text.\nPOST http://localhost:\(viewModel.localAPIPort)/v1/dictation/start")
+                    .onChange(of: viewModel.localAPIAllowControl) { _ in viewModel.save() }
+                    .disabled(!viewModel.localAPIEnabled)
+        }
     }
 
     // MARK: - Screen Context Row
