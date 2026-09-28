@@ -25,6 +25,7 @@ Sources/SpeakFreeLib/
 ├── AppDelegate.swift       # App lifecycle, hotkey listener, menu bar
 ├── AudioRecorder.swift     # Microphone recording
 ├── Config.swift            # Config loading/saving (~/.config/speakfree/config.json)
+├── DictationSession.swift  # Recording flow: capture, transcription, delivery (public API)
 ├── HotkeyManager.swift     # Global hotkey detection via CGEvent taps
 ├── KeyCodes.swift          # Key name/code mapping and parsing
 ├── ModelDownloader.swift   # Whisper model download from HuggingFace

@@ -6,7 +6,9 @@ import Carbon.HIToolbox
 import ApplicationServices
 import IOKit
 
-class TextInserter {
+/// Types text at the cursor: AX, synthetic keystrokes or a clipboard paste depending on the
+/// target app, with the Secure Input, remote-desktop and focus-restore guards.
+public class TextInserter {
     // Cache the 'v' key code — only changes if keyboard layout changes
     private var cachedVKeyCode: CGKeyCode?
     private var cachedInputSourceID: String?
@@ -103,13 +105,14 @@ class TextInserter {
     private var pendingRestore: PendingClipboardRestore?
     private var pendingBackstop: DispatchWorkItem?
 
+    public init() {}
+
     /// Pure check: should a space be prepended given the text ALREADY captured before
     /// the cursor at record-start?
     ///
-    /// This is the zero-latency path: `AppDelegate` captures cursor context off the main
-    /// thread at record-start (inside `captureFocusedElement`) and stores it in
-    /// `recordingContextText`. By the time `finalizeRecording` runs, the answer is already
-    /// available — no AX query, no semaphore, no main-thread stall.
+    /// This is the zero-latency path: `DictationSession` captures cursor context off the main
+    /// thread at record-start (`CursorContextCapture`). By the time its finalize runs, the
+    /// answer is already available — no AX query, no semaphore, no main-thread stall.
     ///
     /// Returns true when the last non-empty character of `contextBefore` is a non-whitespace,
     /// non-newline character — i.e. the cursor immediately follows printable text.
@@ -235,7 +238,7 @@ class TextInserter {
     /// probed at call time (racy, untestable).
     var livePrependProbeSuppressed = false
 
-    func shouldPrependSpace(before element: AXUIElement?) -> Bool {
+    public func shouldPrependSpace(before element: AXUIElement?) -> Bool {
         if livePrependProbeSuppressed {
             DiagnosticLogger.shared.log("TextInserter: prepend probe skipped (Electron-class target)")
             return false
@@ -288,7 +291,7 @@ class TextInserter {
     // org.nspasteboard.ConcealedType/TransientType markers + auto-clear, so clipboard-history
     // tools skip it and the plaintext doesn't linger. The caller is notified via onFocusLost.
     @discardableResult
-    func insert(text: String, refocusing element: AXUIElement? = nil, onFocusLost: (() -> Void)? = nil) -> Bool {
+    public func insert(text: String, refocusing element: AXUIElement? = nil, onFocusLost: (() -> Void)? = nil) -> Bool {
         if isSecureInputActive() {
             DiagnosticLogger.shared.log("TextInserter: Secure Input is active — concealed clipboard fallback instead of inserting")
             secureInputClipboardFallback(text)
@@ -744,7 +747,7 @@ class TextInserter {
         "com.moonlight-stream.Moonlight",    // Moonlight
     ]
 
-    func isRemoteDesktopFrontmost() -> Bool {
+    public func isRemoteDesktopFrontmost() -> Bool {
         Self.isRemoteDesktop(bundleID: frontmostBundleIDProvider())
     }
 
@@ -1152,22 +1155,22 @@ class TextInserter {
     /// How long dictated text may sit on the clipboard after a Secure-Input fallback before it
     /// is auto-cleared. Seam so tests can shrink it. Production default: 15 s — short enough
     /// that the plaintext does not linger, yet long enough for most users to paste.
-    var secureInputClipboardClearDelay: TimeInterval = 15
+    public var secureInputClipboardClearDelay: TimeInterval = 15
 
     /// Why the concealed clipboard path was taken. The distinction matters to the UI:
     /// `.secureInput` means the text was definitely NOT inserted, so telling the user to
     /// press ⌘V (and auto-retrying the insert) is safe; `.axTimeoutMayHaveCommitted`
     /// means the AX write MAY have landed, so any retry or paste prompt risks a duplicate
     /// — the UI must stay at "copied" and do nothing clever.
-    enum ConcealedFallbackReason { case secureInput, axTimeoutMayHaveCommitted }
+    public enum ConcealedFallbackReason { case secureInput, axTimeoutMayHaveCommitted }
 
     /// Called when `insert()` falls back to the concealed Secure-Input clipboard path instead of
     /// inserting text directly. Unlike `onFocusLost` (which fires for any focus failure), this
     /// fires ONLY for the concealed-copy cases so the UI can react (Secure-Input retry
     /// dialog / auto-clear notification). Carries the dictated text so the `.secureInput`
     /// case can auto-retry the insertion once Secure Input clears (Michael 2026-08-12).
-    /// Set by the caller (AppDelegate) before each insertion.
-    var onSecureInputFallback: ((String, ConcealedFallbackReason) -> Void)?
+    /// Set by the caller (`DictationSession`) before each insertion.
+    public var onSecureInputFallback: ((String, ConcealedFallbackReason) -> Void)?
 
     /// Secure-Input clipboard fallback (audit AR-1). Dictating into a password field is the
     /// worst case, so unlike `copyToClipboard` this:

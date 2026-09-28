@@ -2,9 +2,9 @@
 import ApplicationServices
 import Foundation
 
-/// Testable core of `AppDelegate.finalizeRecording`: the record → transcribe → insert
-/// decision logic, lifted out of AppDelegate so it can be driven by a FakeEngine + a
-/// MockInserter under XCTest without AppKit, a real audio engine, or a live cursor.
+/// Testable core of `DictationSession.finalizeRecording`: the record → transcribe → insert
+/// decision logic, kept pure so it can be driven by a FakeEngine + a MockInserter under
+/// XCTest without AppKit, a real audio engine, or a live cursor.
 ///
 /// Sharing contract (audit 2026-07-03): `finalizeRecording` CALLS the pure pieces of this
 /// type directly — `minSamples`/`silenceRMSThreshold`/`rms` for the gates, `resolveRaw`

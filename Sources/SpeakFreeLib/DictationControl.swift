@@ -1,12 +1,5 @@
 import Foundation
 
-/// Where an API-started dictation's text goes: back to the HTTP caller, or typed at the cursor
-/// exactly like a hotkey dictation.
-public enum DictationAPIDestination: String, Equatable {
-    case caller
-    case cursor
-}
-
 /// Lifecycle of a dictation as seen over the local API. `idle` is only ever a stream state (no
 /// dictation in progress); a session moves recording → transcribing → done | error, or → cancelled.
 public enum DictationPhase: String, Equatable {
@@ -17,16 +10,17 @@ public enum DictationPhase: String, Equatable {
 
 /// One API-started dictation. Text fields are filled only for `destination == .caller` sessions
 /// that finished; a cursor session's text goes to the focused app, never back over the API.
-public struct DictationSession: Equatable {
+public struct DictationAPISession: Equatable {
     public let id: UUID
-    public let destination: DictationAPIDestination
+    public internal(set) var destination: DictationDestination
     public internal(set) var phase: DictationPhase
     public internal(set) var result: CallerFinalizePayload?
     public internal(set) var error: String?
 }
 
-/// The recording pipeline the control center drives. AppDelegate conforms, reusing the exact
-/// hotkey start/stop/abort path; tests substitute a stub so no microphone or model is needed.
+/// The recording pipeline the control center drives. `DictationSession` conforms; tests
+/// substitute a stub so no microphone or model is needed.
+@MainActor
 protocol DictationDriver: AnyObject {
     /// True while a take is being captured (key held, toggle on, or post-buffer still running).
     var isDictating: Bool { get }
@@ -35,31 +29,55 @@ protocol DictationDriver: AnyObject {
     /// Current input level, 0...1.
     var inputLevel: Float { get }
     /// Start recording for an API session. Returns nil once recording started, else a reason.
-    /// The driver must report the outcome through the control center's `pipeline…` hooks.
-    func startAPIDictation(sessionID: UUID, destination: DictationAPIDestination) -> String?
+    /// The take's progress reaches the control center's `pipeline…` hooks (for a session,
+    /// through `attach(to:)`).
+    func startAPIDictation(sessionID: UUID, destination: DictationDestination) -> String?
     /// Stop capture and finalize (same path as releasing the hotkey).
     func stopAPIDictation()
-    /// Abort capture and discard the take (same path as a cancelled key press).
+    /// Abort capture and discard the take.
     func cancelAPIDictation()
+}
+
+extension DictationSession: DictationDriver {
+    var isDictating: Bool { isCapturing }
+    var activeEngineID: String { engineID }
+
+    func startAPIDictation(sessionID: UUID, destination: DictationDestination) -> String? {
+        // A start during the post-buffer would continue the hotkey take, not begin this session.
+        guard !isCapturing else { return DictationFailure.busy.message }
+        switch start(destination: destination, takeID: sessionID) {
+        case .started, .resumed:
+            return nil
+        case .refused(let failure) where failure == .notReady || failure == .busy:
+            return failure.message
+        case .refused, .failed:
+            return DictationFailure.microphoneUnavailable.message
+        }
+    }
+
+    func stopAPIDictation() { stopRecording() }
+
+    func cancelAPIDictation() { cancel() }
 }
 
 /// Session registry + event fan-out for the local API's dictation control endpoints.
 ///
-/// Main-thread only: the server hops to the main queue before calling in, and AppDelegate reports
-/// pipeline progress from main. That keeps the state machine free of locks and in the same order
-/// as the pipeline that drives it.
+/// Main actor only: the server hops to the main queue before calling in, and the dictation
+/// session reports progress from main. That keeps the state machine free of locks and in the same
+/// order as the pipeline that drives it.
 ///
 /// Every dictation — hotkey or API — is reported through the `pipeline…` hooks so `/v1/events`
 /// subscribers see one consistent state stream. Events never carry transcript text: a subscriber
 /// learns THAT a dictation finished, and only the session's own caller can fetch its text.
+@MainActor
 final class DictationControlCenter {
 
-    static let defaultTimeoutMs = 5 * 60 * 1_000
-    static let maxTimeoutMs = 30 * 60 * 1_000
-    static let levelInterval: TimeInterval = 0.1
-    static let keepaliveInterval: TimeInterval = 15
+    nonisolated static let defaultTimeoutMs = 5 * 60 * 1_000
+    nonisolated static let maxTimeoutMs = 30 * 60 * 1_000
+    nonisolated static let levelInterval: TimeInterval = 0.1
+    nonisolated static let keepaliveInterval: TimeInterval = 15
     /// Finished sessions kept for `GET /v1/dictation/{id}`.
-    static let retainedSessions = 32
+    nonisolated static let retainedSessions = 32
 
     enum ControlError: Error, Equatable {
         case notReady
@@ -72,7 +90,7 @@ final class DictationControlCenter {
 
     weak var driver: DictationDriver?
 
-    private(set) var sessions: [UUID: DictationSession] = [:]
+    private(set) var sessions: [UUID: DictationAPISession] = [:]
     private var sessionOrder: [UUID] = []
     /// The API session currently recording or transcribing, if any.
     private(set) var activeSessionID: UUID?
@@ -81,14 +99,16 @@ final class DictationControlCenter {
     private var streamSessionID: UUID?
 
     private var subscribers: [UUID: (String) -> Void] = [:]
-    private var stopWaiters: [UUID: [(DictationSession) -> Void]] = [:]
+    private var stopWaiters: [UUID: [(DictationAPISession) -> Void]] = [:]
     private var timeoutWork: DispatchWorkItem?
     private var levelTimer: DispatchSourceTimer?
     private var keepaliveTimer: DispatchSourceTimer?
 
+    nonisolated init() {}
+
     // MARK: - Control (called by LocalAPIServer on main)
 
-    func start(destination: DictationAPIDestination, engine: String?, timeoutMs: Int?) -> Result<DictationSession, ControlError> {
+    func start(destination: DictationDestination, engine: String?, timeoutMs: Int?) -> Result<DictationAPISession, ControlError> {
         guard let driver = driver else { return .failure(.notReady) }
         if let engine = engine, engine != driver.activeEngineID {
             return .failure(.engineMismatch(active: driver.activeEngineID))
@@ -96,7 +116,7 @@ final class DictationControlCenter {
         if activeSessionID != nil || driver.isDictating { return .failure(.busy) }
 
         let id = UUID()
-        remember(DictationSession(id: id, destination: destination, phase: .recording, result: nil, error: nil))
+        remember(DictationAPISession(id: id, destination: destination, phase: .recording, result: nil, error: nil))
         activeSessionID = id
         if let reason = driver.startAPIDictation(sessionID: id, destination: destination) {
             // The driver may already have reported pipelineDidFail; finish() settles only once.
@@ -117,7 +137,7 @@ final class DictationControlCenter {
 
     /// Stop recording and call `completion` once the session reaches a terminal phase (immediately
     /// if it already has — stop is idempotent).
-    func stop(id: UUID, completion: @escaping (DictationSession) -> Void) -> ControlError? {
+    func stop(id: UUID, completion: @escaping (DictationAPISession) -> Void) -> ControlError? {
         guard let session = sessions[id] else { return .notFound }
         if session.phase.isTerminal { completion(session); return nil }
         stopWaiters[id, default: []].append(completion)
@@ -128,10 +148,10 @@ final class DictationControlCenter {
         return nil
     }
 
-    /// Cancel a session. While recording the take is aborted. While transcribing, a caller
+    /// Cancel a session. While recording the take is discarded. While transcribing, a caller
     /// session's result is discarded; a cursor session cannot be recalled (the text is about to be
     /// typed), so that is refused.
-    func cancel(id: UUID) -> Result<DictationSession, ControlError> {
+    func cancel(id: UUID) -> Result<DictationAPISession, ControlError> {
         guard let session = sessions[id] else { return .failure(.notFound) }
         switch session.phase {
         case .recording:
@@ -149,9 +169,50 @@ final class DictationControlCenter {
         return .success(sessions[id]!)
     }
 
-    func session(id: UUID) -> DictationSession? { sessions[id] }
+    func session(id: UUID) -> DictationAPISession? { sessions[id] }
 
-    // MARK: - Pipeline hooks (called by AppDelegate on main for EVERY dictation)
+    // MARK: - Session events
+
+    /// Drive `session` and report every take it runs, hotkey ones included. Attach before the
+    /// host adds its own observer, so an API caller hears about a finished or failed take before
+    /// the host presents anything modal.
+    func attach(to session: DictationSession) {
+        driver = session
+        session.addObserver { [weak self] takeID, event in
+            self?.sessionDidReport(takeID: takeID, event: event)
+        }
+    }
+
+    private func sessionDidReport(takeID: UUID, event: DictationEvent) {
+        // Takes this center did not start are hotkey dictations: no session, nil id.
+        let id: UUID? = sessions[takeID] == nil ? nil : takeID
+        switch event {
+        case .recording:
+            pipelineDidStartRecording(sessionID: id)
+        case .transcribing:
+            pipelineDidBeginTranscribing(sessionID: id)
+        case .retargeted(let destination):
+            if let id, sessions[id]?.phase.isTerminal == false { sessions[id]?.destination = destination }
+        case .finished(let result):
+            switch result.delivery {
+            case .returnedToCaller:
+                pipelineDidFinish(sessionID: id, result: CallerFinalizePayload(
+                    sessionID: takeID, raw: result.raw, processed: result.processed, styled: result.styled))
+            case .editSession:
+                pipelineDidFinish(sessionID: nil, result: nil)
+            case .inserted, .copiedToClipboard, .nothingToInsert:
+                pipelineDidFinish(sessionID: id, result: nil)
+            }
+        case .failed(let failure):
+            pipelineDidFail(sessionID: id, message: failure.message)
+        case .cancelled:
+            pipelineDidCancel(sessionID: id)
+        default:
+            break
+        }
+    }
+
+    // MARK: - Pipeline hooks (called on main for EVERY dictation)
     //
     // `sessionID` is nil for hotkey dictations: they still move the event stream, but no session.
 
@@ -235,7 +296,7 @@ final class DictationControlCenter {
 
     /// One Server-Sent Events frame. Multi-line data is split into one `data:` line per line, as
     /// the SSE spec requires, and the frame ends with the blank-line terminator.
-    static func sseFrame(event: String?, data: String) -> String {
+    nonisolated static func sseFrame(event: String?, data: String) -> String {
         var out = ""
         if let event = event { out += "event: \(event)\n" }
         let lines = data.replacingOccurrences(of: "\r\n", with: "\n")
@@ -244,22 +305,22 @@ final class DictationControlCenter {
         return out + "\n"
     }
 
-    static func stateFrame(_ phase: DictationPhase, sessionID: UUID?, error: String?) -> String {
+    nonisolated static func stateFrame(_ phase: DictationPhase, sessionID: UUID?, error: String?) -> String {
         var obj: [String: Any] = ["state": phase.rawValue, "id": sessionID?.uuidString ?? NSNull()]
         if let error = error { obj["error"] = error }
         return sseFrame(event: "state", data: json(obj))
     }
 
-    static func levelFrame(_ level: Float, sessionID: UUID?) -> String {
+    nonisolated static func levelFrame(_ level: Float, sessionID: UUID?) -> String {
         let rounded = (Double(max(0, min(1, level))) * 1000).rounded() / 1000
         return sseFrame(event: "level", data: json(["level": rounded, "id": sessionID?.uuidString ?? NSNull()]))
     }
 
     /// SSE comment line; keeps idle connections alive and surfaces dead clients as send errors.
-    static let keepaliveFrame = ": keepalive\n\n"
+    nonisolated static let keepaliveFrame = ": keepalive\n\n"
 
     /// JSON view of a session for the HTTP responses. Text only for finished caller sessions.
-    static func sessionJSON(_ s: DictationSession) -> String {
+    nonisolated static func sessionJSON(_ s: DictationAPISession) -> String {
         var obj: [String: Any] = [
             "id": s.id.uuidString,
             "state": s.phase.rawValue,
@@ -274,7 +335,7 @@ final class DictationControlCenter {
         return json(obj)
     }
 
-    static func json(_ obj: [String: Any]) -> String {
+    nonisolated static func json(_ obj: [String: Any]) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               let s = String(data: data, encoding: .utf8) else { return "{}" }
         return s
@@ -282,7 +343,7 @@ final class DictationControlCenter {
 
     // MARK: - Internals
 
-    private func remember(_ session: DictationSession) {
+    private func remember(_ session: DictationAPISession) {
         sessions[session.id] = session
         sessionOrder.append(session.id)
         while sessionOrder.count > Self.retainedSessions {

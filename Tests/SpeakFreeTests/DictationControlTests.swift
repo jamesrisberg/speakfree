@@ -3,22 +3,24 @@ import XCTest
 
 /// Local API dictation control: the session state machine, the caller destination, and the SSE
 /// framing. The recording pipeline is a stub driver that reports back through the same
-/// `pipeline…` hooks AppDelegate calls, so no microphone, model, or AppKit is involved.
+/// `pipeline…` hooks a `DictationSession`'s events drive, so no microphone, model, or AppKit is
+/// involved. DictationSessionTests covers the center driving a real session.
+@MainActor
 final class DictationControlTests: XCTestCase {
 
-    /// Stands in for AppDelegate: records calls and lets each test script the pipeline's reports.
+    /// Stands in for the session: records calls and lets each test script the pipeline's reports.
     final class StubDriver: DictationDriver {
         weak var center: DictationControlCenter?
         var isDictating = false
         var activeEngineID = "parakeet"
         var inputLevel: Float = 0.5
         var startFailure: String?
-        var started: [(UUID, DictationAPIDestination)] = []
+        var started: [(UUID, DictationDestination)] = []
         var stops = 0
         var cancels = 0
         private var current: UUID?
 
-        func startAPIDictation(sessionID: UUID, destination: DictationAPIDestination) -> String? {
+        func startAPIDictation(sessionID: UUID, destination: DictationDestination) -> String? {
             if let failure = startFailure { return failure }
             started.append((sessionID, destination))
             current = sessionID
@@ -65,7 +67,7 @@ final class DictationControlTests: XCTestCase {
         }
     }
 
-    private func startSession(_ destination: DictationAPIDestination = .caller) throws -> DictationSession {
+    private func startSession(_ destination: DictationDestination = .caller) throws -> DictationAPISession {
         try center.start(destination: destination, engine: nil, timeoutMs: nil).get()
     }
 
@@ -76,7 +78,7 @@ final class DictationControlTests: XCTestCase {
         XCTAssertEqual(session.phase, .recording)
         XCTAssertEqual(driver.started.first?.1, .caller)
 
-        var delivered: DictationSession?
+        var delivered: DictationAPISession?
         XCTAssertNil(center.stop(id: session.id) { delivered = $0 })
         XCTAssertEqual(driver.stops, 1)
         XCTAssertNil(delivered, "stop must wait for the transcription, not answer immediately")
@@ -100,7 +102,7 @@ final class DictationControlTests: XCTestCase {
 
     func testCursorSessionNeverExposesText() throws {
         let session = try startSession(.cursor)
-        var delivered: DictationSession?
+        var delivered: DictationAPISession?
         _ = center.stop(id: session.id) { delivered = $0 }
         // Cursor takes insert at the cursor; AppDelegate reports no payload.
         center.pipelineDidFinish(sessionID: session.id, result: nil)
@@ -113,7 +115,7 @@ final class DictationControlTests: XCTestCase {
         let session = try startSession()
         _ = center.stop(id: session.id) { _ in }
         center.pipelineDidFinish(sessionID: session.id, result: nil)
-        var again: DictationSession?
+        var again: DictationAPISession?
         XCTAssertNil(center.stop(id: session.id) { again = $0 })
         XCTAssertEqual(again?.phase, .done)
         XCTAssertEqual(driver.stops, 1, "a second stop must not touch the recorder")
@@ -121,7 +123,7 @@ final class DictationControlTests: XCTestCase {
 
     func testPipelineFailureSettlesSessionWithError() throws {
         let session = try startSession()
-        var delivered: DictationSession?
+        var delivered: DictationAPISession?
         _ = center.stop(id: session.id) { delivered = $0 }
         center.pipelineDidFail(sessionID: session.id, message: "No speech captured")
         XCTAssertEqual(delivered?.phase, .error)

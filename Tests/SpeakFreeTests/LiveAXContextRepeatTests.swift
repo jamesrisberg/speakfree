@@ -13,11 +13,11 @@ final class LiveAXContextRepeatTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        AppDelegate.resetLiveAXContextMemory()
+        CursorContextCapture.resetLiveAXContextMemory()
     }
 
     override func tearDown() {
-        AppDelegate.resetLiveAXContextMemory()
+        CursorContextCapture.resetLiveAXContextMemory()
         super.tearDown()
     }
 
@@ -25,10 +25,10 @@ final class LiveAXContextRepeatTests: XCTestCase {
     /// First read is allowed (we cannot know yet); every repeat is rejected.
     func testTheConstantStringIsRejectedFromTheSecondReadOnward() {
         let chrome = String(repeating: "x", count: 32)
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat(chrome, bundleID: "com.microsoft.VSCode"),
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat(chrome, bundleID: "com.microsoft.VSCode"),
                        "the first sighting cannot be judged a repeat")
         for read in 2...40 {
-            XCTAssertTrue(AppDelegate.liveAXContextIsRepeat(chrome, bundleID: "com.microsoft.VSCode"),
+            XCTAssertTrue(CursorContextCapture.liveAXContextIsRepeat(chrome, bundleID: "com.microsoft.VSCode"),
                           "read \(read) of the identical string must be rejected")
         }
     }
@@ -45,7 +45,7 @@ final class LiveAXContextRepeatTests: XCTestCase {
             "ok so now ",
         ]
         for context in real {
-            XCTAssertFalse(AppDelegate.liveAXContextIsRepeat(context, bundleID: app),
+            XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat(context, bundleID: app),
                            "changing context must be trusted: \(context)")
         }
     }
@@ -54,8 +54,8 @@ final class LiveAXContextRepeatTests: XCTestCase {
     func testAlternatingBetweenTwoDistinctContextsIsAccepted() {
         let app = "com.microsoft.VSCode"
         for _ in 0..<10 {
-            XCTAssertFalse(AppDelegate.liveAXContextIsRepeat("first field text", bundleID: app))
-            XCTAssertFalse(AppDelegate.liveAXContextIsRepeat("second field text", bundleID: app))
+            XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat("first field text", bundleID: app))
+            XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat("second field text", bundleID: app))
         }
     }
 
@@ -63,35 +63,35 @@ final class LiveAXContextRepeatTests: XCTestCase {
     /// so one app's chrome cannot suppress another app's genuine context.
     func testMemoryIsPerApp() {
         let same = "Search for "
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat(same, bundleID: "com.microsoft.VSCode"))
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat(same, bundleID: "com.apple.MobileSMS"),
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat(same, bundleID: "com.microsoft.VSCode"))
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat(same, bundleID: "com.apple.MobileSMS"),
                        "a different app has its own memory")
-        XCTAssertTrue(AppDelegate.liveAXContextIsRepeat(same, bundleID: "com.microsoft.VSCode"))
-        XCTAssertTrue(AppDelegate.liveAXContextIsRepeat(same, bundleID: "com.apple.MobileSMS"))
+        XCTAssertTrue(CursorContextCapture.liveAXContextIsRepeat(same, bundleID: "com.microsoft.VSCode"))
+        XCTAssertTrue(CursorContextCapture.liveAXContextIsRepeat(same, bundleID: "com.apple.MobileSMS"))
     }
 
     /// A nil bundle id must not collapse every app into one bucket with real apps.
     func testNilBundleGetsItsOwnBucket() {
         let text = "some context"
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat(text, bundleID: nil))
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat(text, bundleID: "com.microsoft.VSCode"))
-        XCTAssertTrue(AppDelegate.liveAXContextIsRepeat(text, bundleID: nil))
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat(text, bundleID: nil))
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat(text, bundleID: "com.microsoft.VSCode"))
+        XCTAssertTrue(CursorContextCapture.liveAXContextIsRepeat(text, bundleID: nil))
     }
 
     /// Returning to an unchanged field after visiting another app costs one skipped
     /// context. Documented deliberately: the failure direction is "no lowercase, no
     /// prepended space", which is the safe direction and what 07-24 did all day.
     func testReturningToAnUnchangedFieldIsRejectedAndThatIsTheSafeDirection() {
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat("Hi there ", bundleID: "com.apple.MobileSMS"))
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat("elsewhere", bundleID: "com.microsoft.VSCode"))
-        XCTAssertTrue(AppDelegate.liveAXContextIsRepeat("Hi there ", bundleID: "com.apple.MobileSMS"),
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat("Hi there ", bundleID: "com.apple.MobileSMS"))
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat("elsewhere", bundleID: "com.microsoft.VSCode"))
+        XCTAssertTrue(CursorContextCapture.liveAXContextIsRepeat("Hi there ", bundleID: "com.apple.MobileSMS"),
                       "unchanged field reads as a repeat — accepted cost, fails toward doing nothing")
     }
 
     /// Empty string is still a value and must follow the same rule rather than crashing or
     /// being special-cased into always-trusted.
     func testEmptyContextFollowsTheSameRule() {
-        XCTAssertFalse(AppDelegate.liveAXContextIsRepeat("", bundleID: "com.microsoft.VSCode"))
-        XCTAssertTrue(AppDelegate.liveAXContextIsRepeat("", bundleID: "com.microsoft.VSCode"))
+        XCTAssertFalse(CursorContextCapture.liveAXContextIsRepeat("", bundleID: "com.microsoft.VSCode"))
+        XCTAssertTrue(CursorContextCapture.liveAXContextIsRepeat("", bundleID: "com.microsoft.VSCode"))
     }
 }
