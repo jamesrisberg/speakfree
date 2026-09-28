@@ -10,7 +10,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.1"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.1"),
     ],
     targets: [
         // C module wrapping whisper.cpp headers — links against the bundled dylib
