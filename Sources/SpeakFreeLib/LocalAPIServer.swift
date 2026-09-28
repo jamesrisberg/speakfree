@@ -76,8 +76,14 @@ final class LocalAPIServer {
 
     // MARK: - Lifecycle
 
+    /// Fires once, on `serverQueue`, when the listener reaches `.ready` (bound and accepting).
+    /// `NWListener.start(queue:)` returns before the bind/listen actually lands — the caller
+    /// has no synchronous guarantee the port is open — so live tests wait on this instead of
+    /// polling `lsof` or sleeping a guessed duration, either of which can undershoot on a
+    /// loaded machine and connect before the socket is really there.
     func start(transcriber: Transcriber, allowBrowser: Bool = false, authToken: String? = nil,
-               allowControl: Bool = false, control: DictationControlCenter? = nil) {
+               allowControl: Bool = false, control: DictationControlCenter? = nil,
+               onReady: (() -> Void)? = nil) {
         stop()
         // NW-A: the server just started, so nothing is in flight. Sweep any temp audio left
         // behind in tmp/api by a crash/kill during a previous transcription (the per-request
@@ -110,6 +116,7 @@ final class LocalAPIServer {
             switch state {
             case .ready:
                 print("LocalAPI (experimental): http://127.0.0.1:\(self?.listenPort ?? 0)/v1/audio/transcriptions")
+                onReady?()
             case .failed(let error):
                 print("LocalAPI: listener failed: \(error)")
             default:
@@ -124,8 +131,22 @@ final class LocalAPIServer {
         listener?.start(queue: serverQueue)
     }
 
-    func stop() {
-        listener?.cancel()
+    /// `completion` fires once the listener reaches `.cancelled` — Network.framework tears the
+    /// socket down asynchronously, so callers that need the port truly free before rebinding
+    /// (live tests reusing one ephemeral port across cases) must wait for it rather than assume
+    /// `cancel()` released it synchronously. Production call sites pass nothing and stay
+    /// fire-and-forget, matching prior behavior.
+    func stop(completion: (() -> Void)? = nil) {
+        if let listener {
+            if let completion {
+                listener.stateUpdateHandler = { state in
+                    if case .cancelled = state { completion() }
+                }
+            }
+            listener.cancel()
+        } else {
+            completion?()
+        }
         listener = nil
         connectionCountLock.lock()
         activeConnections = 0
