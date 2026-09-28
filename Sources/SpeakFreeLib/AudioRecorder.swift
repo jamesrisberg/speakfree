@@ -5,7 +5,7 @@ import Foundation
 
 /// Recording and pre-roll storage. Device lifecycle lives on independent workers;
 /// the short capture-control queue owns recording boundaries and sample ordering.
-class AudioRecorder {
+public class AudioRecorder {
     private(set) var capture: MicrophoneCaptureCoordinator!
     private let writeQueue = DispatchQueue(label: "com.speakfree.audiowrite")
     private let healthLock = NSLock()
@@ -24,9 +24,13 @@ class AudioRecorder {
     private var monitorsStarted = false // main
     private var observers: [NSObjectProtocol] = []
     private(set) var pinnedInputDeviceUID: String?
-    var onCaptureStatus: ((String) -> Void)?
+    public var onCaptureStatus: ((String) -> Void)?
 
-    init(factory: @escaping () -> DeviceCapturing = { DeviceAudioSession() }) {
+    public convenience init() {
+        self.init(factory: { DeviceAudioSession() })
+    }
+
+    init(factory: @escaping () -> DeviceCapturing) {
         capture = MicrophoneCaptureCoordinator(factory: factory, samples: { [weak self] samples, source in
             self?.receive(samples, source: source)
         }, status: { [weak self] message in
@@ -34,7 +38,7 @@ class AudioRecorder {
         })
     }
 
-    var preBufferEnabled = true {
+    public var preBufferEnabled = true {
         didSet {
             let enabled = preBufferEnabled
             capture.queue.async {
@@ -44,13 +48,13 @@ class AudioRecorder {
             updateRouting()
         }
     }
-    var currentLevel: Float { min(currentRMS / 0.15, 1) }
+    public var currentLevel: Float { min(currentRMS / 0.15, 1) }
     var currentRMS: Float {
         healthLock.lock(); defer { healthLock.unlock() }
         return latestRMS
     }
 
-    func warmUp() {
+    public func warmUp() {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in self?.warmUp() }; return
         }
@@ -78,7 +82,7 @@ class AudioRecorder {
             pin: pinnedInputDeviceUID, prelisten: preBufferEnabled)
     }
 
-    func setPinnedInputDevice(uid: String?) {
+    public func setPinnedInputDevice(uid: String?) {
         guard uid != pinnedInputDeviceUID else { return }
         pinnedInputDeviceUID = uid
         updateRouting()
@@ -98,7 +102,7 @@ class AudioRecorder {
         capture.queue.async { self.preroll = [] }
         capture.recoverFailedCapture()
     }
-    func shutdown() { capture.stop() }
+    public func shutdown() { capture.stop() }
 
     func currentCaptureDeviceName() -> String? {
         capture.queue.sync { recordingSources.isEmpty ? lastSource : recordingSources.joined(separator: " → ") }

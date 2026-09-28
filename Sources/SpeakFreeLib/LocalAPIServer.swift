@@ -372,7 +372,7 @@ final class LocalAPIServer {
 
     /// A parsed, authorized dictation-control request (only produced when control is allowed).
     enum ControlRequest: Equatable {
-        case start(destination: DictationAPIDestination, engine: String?, timeoutMs: Int?)
+        case start(destination: DictationDestination, engine: String?, timeoutMs: Int?)
         case stop(UUID)
         case cancel(UUID)
         case state(UUID)
@@ -474,11 +474,11 @@ final class LocalAPIServer {
                 }
                 obj = parsed
             }
-            let destination: DictationAPIDestination
+            let destination: DictationDestination
             switch obj["destination"] {
             case nil: destination = .caller
             case let raw as String:
-                guard let d = DictationAPIDestination(rawValue: raw) else {
+                guard let d = DictationDestination(rawValue: raw) else {
                     return error(400, "destination must be \"caller\" or \"cursor\"")
                 }
                 destination = d
@@ -553,7 +553,7 @@ final class LocalAPIServer {
         case .transcribe(let fileData, let format):
             transcribeData(fileData, format: format, conn: conn, allowOrigin: allowedOrigin)
         case .control(let request):
-            // The control center is main-thread only (it drives AppDelegate's recording path).
+            // The control center is main-actor only (it drives the dictation session).
             DispatchQueue.main.async { [weak self] in
                 self?.handleControl(request, conn: conn, allowOrigin: allowedOrigin)
             }
@@ -562,6 +562,7 @@ final class LocalAPIServer {
 
     // MARK: - Dictation control
 
+    @MainActor
     private func handleControl(_ request: ControlRequest, conn: NWConnection, allowOrigin: String?) {
         func reply(_ status: Int, _ body: String) {
             send(conn, status: status, body: body, allowOrigin: allowOrigin)
@@ -628,10 +629,13 @@ final class LocalAPIServer {
                 conn.cancel()
             }
         }
-        token = control.subscribe { frame in
-            conn.send(content: frame.data(using: .utf8), completion: .contentProcessed { error in
-                if error != nil { close() }
-            })
+        // Called from handleControl on the main actor.
+        MainActor.assumeIsolated {
+            token = control.subscribe { frame in
+                conn.send(content: frame.data(using: .utf8), completion: .contentProcessed { error in
+                    if error != nil { close() }
+                })
+            }
         }
         // Any further read ending (client closed, reset) tears the stream down.
         func watch() {

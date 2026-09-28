@@ -186,9 +186,9 @@ final class SpeechAuditDefectTests: XCTestCase {
     }
 
     func testElectronRejectsLiveAXButKeepsRememberedTailEligible() {
-        XCTAssertNil(AppDelegate.liveCursorContext(
+        XCTAssertNil(CursorContextCapture.liveCursorContext(
             "untrusted Electron AX text", isElectronClass: true))
-        XCTAssertEqual(AppDelegate.liveCursorContext(
+        XCTAssertEqual(CursorContextCapture.liveCursorContext(
             "native editor text", isElectronClass: false), "native editor text")
 
         let remembered = FinalizePipeline.fallbackCursorContext(

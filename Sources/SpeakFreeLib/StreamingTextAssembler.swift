@@ -1,12 +1,9 @@
 // Claude · 2026-06-10 · Session: 5b06900b-1498-4764-a786-48f408c36626
 import Foundation
 
-/// Testable extraction of `AppDelegate.buildStableDisplayText` + its `committedStreamingText`
-/// state. Builds stable streaming display text: once a sentence ends in `.!?` it is *committed*
+/// Builds stable streaming display text: once a sentence ends in `.!?` it is *committed*
 /// (frozen, never reflows) and subsequent partials append after it on a new line.
-///
-/// The logic here is byte-identical to the inline version it replaces; AppDelegate keeps a
-/// single `StreamingTextAssembler` and forwards `buildStableDisplayText` to `append(_:)`.
+/// `DictationSession` keeps one per take and reports `append(_:)`'s result as partial text.
 public struct StreamingTextAssembler {
     /// Text already committed (sentences that have ended). Frozen across partials.
     public private(set) var committedStreamingText: String = ""

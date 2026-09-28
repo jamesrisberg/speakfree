@@ -551,6 +551,7 @@ final class LocalAPIServerLiveTests: XCTestCase {
 
     /// Full round trip over a real socket: /v1/events streams the lifecycle, start returns a session
     /// id, stop long-polls until the (stubbed) pipeline finishes and returns the caller's text.
+    @MainActor
     func testLiveControlCallerRoundTripWithEventStream() throws {
         try skipIfDisabled()
         let center = DictationControlCenter()
