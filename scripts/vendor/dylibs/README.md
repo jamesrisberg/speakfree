@@ -1,5 +1,9 @@
 # Vendored whisper.cpp + ggml binaries
 
+The speakfree binary links whisper.cpp statically from `../whisper.xcframework`
+(same versions, built by `../build-whisper-xcframework.sh`). The dylibs here
+serve `whisper-cli`, which release bundles ship for the CLI fallback.
+
 These dylibs are pinned at a known-good combination:
 
 - `libwhisper.1.8.3.dylib` — whisper.cpp 1.8.3
