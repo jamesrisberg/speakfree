@@ -16,6 +16,8 @@ class HotkeyManager {
     private var onKeyUp: (() -> Void)?
     private var onAbort: (() -> Void)?
     private var onUserInteraction: ((CursorInteraction) -> Void)?
+    /// Main thread only. Present when `start` was given `gestures`.
+    private var gestureDriver: GestureDriver?
     private var modifierPressed = false
     /// Consecutive swallowed phantom fn-ups (failsafe cap 4; reset on honored release).
     private var phantomUpStreak = 0
@@ -32,15 +34,36 @@ class HotkeyManager {
         self.requiredModifiers = modifiers
     }
 
+    /// Opt-in gesture recognition on top of the raw key callbacks (see
+    /// `KeyGestureRecognizer`). Without it the manager reports only raw presses and
+    /// releases. With it the raw callbacks keep firing and `onIntent` receives the
+    /// recognizer's output for the same presses, so a consumer that drives dictation from
+    /// intents passes no-op raw handlers.
+    struct Gestures {
+        var mode: KeyGestureRecognizer.Mode
+        var configuration: KeyGestureRecognizer.Configuration
+        /// Read on the main thread before each event.
+        var isSessionActive: () -> Bool
+        /// Called on the main thread.
+        var onIntent: (KeyGestureRecognizer.Intent) -> Void
+    }
+
+    /// Monotonic clock for gesture timing, read when an event arrives. A test seam.
+    var gestureClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+
+    /// Runs the gesture expiry timer on the main queue after a delay. A test seam.
+    var gestureScheduler: (TimeInterval, @escaping () -> Void) -> Void = { delay, work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     func start(
         onKeyDown: @escaping () -> Void,
         onKeyUp: @escaping () -> Void,
         onAbort: (() -> Void)? = nil,
-        onUserInteraction: ((CursorInteraction) -> Void)? = nil
+        onUserInteraction: ((CursorInteraction) -> Void)? = nil,
+        gestures: Gestures? = nil
     ) {
-        self.onKeyDown = onKeyDown
-        self.onKeyUp = onKeyUp
-        self.onAbort = onAbort
+        setCallbacks(onKeyDown: onKeyDown, onKeyUp: onKeyUp, onAbort: onAbort, gestures: gestures)
         self.onUserInteraction = onUserInteraction
         startInteractionMonitor()
         startLifecycleObservers()
@@ -52,6 +75,30 @@ class HotkeyManager {
         } else {
             startGlobalMonitor()
         }
+    }
+
+    private func setCallbacks(onKeyDown: @escaping () -> Void,
+                              onKeyUp: @escaping () -> Void,
+                              onAbort: (() -> Void)?,
+                              gestures: Gestures?) {
+        self.onKeyDown = onKeyDown
+        self.onKeyUp = onKeyUp
+        self.onAbort = onAbort
+        gestureDriver = gestures.map {
+            GestureDriver(gestures: $0, clock: gestureClock, schedule: gestureScheduler)
+        }
+    }
+
+    /// Main thread. Every press and release the manager reports goes through these two, so
+    /// the gesture recognizer sees exactly what the raw callbacks see.
+    private func deliverKeyDown(at time: TimeInterval) {
+        onKeyDown?()
+        gestureDriver?.keyDown(at: time)
+    }
+
+    private func deliverKeyUp(at time: TimeInterval) {
+        onKeyUp?()
+        gestureDriver?.keyUp(at: time)
     }
 
     func stop() {
@@ -66,12 +113,23 @@ class HotkeyManager {
         // deliberate trade against the old behavior (a silently stranded one). At app
         // termination this async block never runs and the recorder is already stopped
         // (applicationWillTerminate), so this exists for teardown races, not quit.
+        // The gesture driver is captured rather than read through `self`, which may be
+        // deinitializing; `finish` settles a pending tap that no timer will now reach.
+        let driver = gestureDriver
+        gestureDriver = nil
         if modifierPressed {
             modifierPressed = false
             phantomUpStreak = 0
             DiagnosticLogger.shared.log("HotkeyManager: stopped while pressed — force-ending take")
             let keyUp = onKeyUp
-            DispatchQueue.main.async { keyUp?() }
+            let time = gestureClock()
+            DispatchQueue.main.async {
+                keyUp?()
+                driver?.keyUp(at: time)
+            }
+        }
+        if let driver {
+            DispatchQueue.main.async { driver.finish() }
         }
         stopLifecycleObservers()
         tearDownEventTap()
@@ -107,9 +165,10 @@ class HotkeyManager {
         phantomUpStreak = 0
         DiagnosticLogger.shared.log(
             "HotkeyManager: release missed during \(reason) — key is physically up, ending take")
+        let time = gestureClock()
         DispatchQueue.main.async {
             self.stopKeyDownMonitor()
-            self.onKeyUp?()
+            self.deliverKeyUp(at: time)
         }
     }
 
@@ -239,6 +298,15 @@ class HotkeyManager {
         self.onKeyUp = onKeyUp
     }
 
+    /// Test-only: install the callbacks `start` would, without any event tap or monitor,
+    /// so synthetic events can be fed to `handleCGEvent` and `handleNSEvent`.
+    func configureForTesting(onKeyDown: @escaping () -> Void,
+                             onKeyUp: @escaping () -> Void,
+                             onAbort: (() -> Void)? = nil,
+                             gestures: Gestures? = nil) {
+        setCallbacks(onKeyDown: onKeyDown, onKeyUp: onKeyUp, onAbort: onAbort, gestures: gestures)
+    }
+
     deinit {
         stop()
     }
@@ -263,7 +331,7 @@ class HotkeyManager {
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: mask,
-            callback: { proxy, type, event, userInfo -> Unmanaged<CGEvent>? in
+            callback: { _, type, event, userInfo -> Unmanaged<CGEvent>? in
                 guard let userInfo = userInfo else { return Unmanaged.passUnretained(event) }
                 let manager = Unmanaged<HotkeyManager>.fromOpaque(userInfo).takeUnretainedValue()
                 // macOS disables taps that stall — destroy and recreate from scratch
@@ -304,7 +372,7 @@ class HotkeyManager {
                     manager.reconcilePressedState("tap disable")
                     return Unmanaged.passUnretained(event)
                 }
-                return manager.handleCGEvent(proxy: proxy, type: type, event: event)
+                return manager.handleCGEvent(type: type, event: event)
             },
             userInfo: selfPtr.toOpaque()
         )
@@ -380,7 +448,8 @@ class HotkeyManager {
         runLoopSource = nil
     }
 
-    private func handleCGEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    /// The event tap's handler (tap thread). Internal so tests can feed synthetic events.
+    func handleCGEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         guard type == .flagsChanged else { return Unmanaged.passUnretained(event) }
         guard event.getIntegerValueField(.keyboardEventKeycode) == Int64(keyCode) else {
             // IMPORTANT: pass through ALL non-fn flagsChanged events unmodified.
@@ -399,11 +468,10 @@ class HotkeyManager {
             return currentMods & requiredModifiers == requiredModifiers
         }()
 
-        // ONE decision function owns consume-vs-pass, and every exit below routes through it.
-        // 2026-07-26 round-3 review proved this necessary by mutation: with the disposition
-        // inlined as four separate `return`s, deleting the redundant-transition swallow entirely
-        // — the whole globe-key fix — still left 30 tests green, because `handleCGEvent` is
-        // private and nothing could observe a return value.
+        // ONE decision function owns consume-vs-pass, and every exit below routes through it,
+        // so the pure `tapDisposition` tests cover every exit. Inlined as separate `return`s,
+        // the redundant-transition swallow (the whole globe-key fix) could be deleted with the
+        // suite still green.
         let disposition = Self.tapDisposition(transition: transition,
                                               keyCode: keyCode,
                                               requiredModifiersSatisfied: modifiersSatisfied)
@@ -416,9 +484,10 @@ class HotkeyManager {
             guard modifiersSatisfied else { return result() }
             modifierPressed = true
             modifierPressedAt = mach_absolute_time()
+            let time = gestureClock()
             DispatchQueue.main.async {
                 self.startKeyDownMonitor()
-                self.onKeyDown?()
+                self.deliverKeyDown(at: time)
             }
             return result()  // consume fn press — suppresses emoji drawer
 
@@ -432,7 +501,7 @@ class HotkeyManager {
             // that could never stop (Michael, 00:52). Failsafe: never swallow more
             // than 4 consecutive ups — if the HID read is ever wrong on some
             // keyboard, the release goes through rather than recording forever.
-            if Self.releaseIsPhantom(physicallyDown: Self.hotkeyIsPhysicallyDown(keyCode: keyCode),
+            if Self.releaseIsPhantom(physicallyDown: physicallyDownRead(keyCode),
                                      phantomUpStreak: phantomUpStreak) {
                 phantomUpStreak += 1
                 DiagnosticLogger.shared.log(
@@ -441,9 +510,10 @@ class HotkeyManager {
             }
             phantomUpStreak = 0
             modifierPressed = false
+            let time = gestureClock()
             DispatchQueue.main.async {
                 self.stopKeyDownMonitor()
-                self.onKeyUp?()
+                self.deliverKeyUp(at: time)
             }
             return result()  // consume — suppresses emoji drawer / system dictation on fn release
 
@@ -550,11 +620,18 @@ class HotkeyManager {
             let elapsedMs = (elapsed * UInt64(timebaseInfo.numer)) / (UInt64(timebaseInfo.denom) * 1_000_000)
             // If a key arrives within 300ms of fn press, it's a keyboard shortcut — abort
             if elapsedMs < 300 {
-                self.modifierPressed = false
-                self.stopKeyDownMonitor()
-                self.onAbort?()
+                self.abortForShortcut()
             }
         }
+    }
+
+    /// Main thread. A key arrived right after the hotkey press, so the press was the start
+    /// of a keyboard shortcut rather than dictation. Internal so tests can drive it.
+    func abortForShortcut() {
+        modifierPressed = false
+        stopKeyDownMonitor()
+        onAbort?()
+        gestureDriver?.abort()
     }
 
     private func stopKeyDownMonitor() {
@@ -762,20 +839,24 @@ class HotkeyManager {
         physicallyDown && phantomUpStreak < 4
     }
 
-    private func handleNSEvent(_ event: NSEvent) {
+    /// The global monitor's handler (main thread). Internal so tests can feed synthetic events.
+    func handleNSEvent(_ event: NSEvent) {
         if event.type == .flagsChanged {
             handleModifierFlagsChanged(event)
             return
         }
         guard event.keyCode == keyCode else { return }
+        // A held key auto-repeats its keyDown; only the first is a press. Without this a
+        // held toggle hotkey started and stopped dictation on every repeat.
+        if event.type == .keyDown, event.isARepeat { return }
         if requiredModifiers != 0 {
             let currentMods = UInt64(event.modifierFlags.rawValue) & 0x00FF0000
             guard currentMods & requiredModifiers == requiredModifiers else { return }
         }
         if event.type == .keyDown {
-            onKeyDown?()
+            deliverKeyDown(at: gestureClock())
         } else if event.type == .keyUp {
-            onKeyUp?()
+            deliverKeyUp(at: gestureClock())
         }
     }
 
@@ -807,11 +888,11 @@ class HotkeyManager {
             // revives would have inherited it.
             modifierPressedAt = mach_absolute_time()
             startKeyDownMonitor()
-            onKeyDown?()
+            deliverKeyDown(at: gestureClock())
         case .keyUp:
             modifierPressed = false
             stopKeyDownMonitor()
-            onKeyUp?()
+            deliverKeyUp(at: gestureClock())
         case .none:
             break
         }
@@ -900,5 +981,61 @@ class HotkeyManager {
         }
         guard modifierFlagBit(for: keyCode) != 0 else { return false }
         return CGEventSource.keyState(.hidSystemState, key: CGKeyCode(keyCode))
+    }
+}
+
+extension HotkeyManager {
+    /// Runs a `KeyGestureRecognizer` on the main thread: supplies the session state, hands
+    /// the intents to the consumer and keeps the expiry timer armed while a tap is pending.
+    final class GestureDriver {
+        private var recognizer: KeyGestureRecognizer
+        private let gestures: Gestures
+        private let clock: () -> TimeInterval
+        private let schedule: (TimeInterval, @escaping () -> Void) -> Void
+        /// Bumped whenever the pending deadline may have changed, so a stale timer is inert.
+        private var expiryGeneration = 0
+
+        init(gestures: Gestures,
+             clock: @escaping () -> TimeInterval,
+             schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void) {
+            self.recognizer = KeyGestureRecognizer(mode: gestures.mode,
+                                                   configuration: gestures.configuration)
+            self.gestures = gestures
+            self.clock = clock
+            self.schedule = schedule
+        }
+
+        func keyDown(at time: TimeInterval) {
+            deliver(recognizer.keyDown(at: time, sessionActive: gestures.isSessionActive()))
+        }
+
+        func keyUp(at time: TimeInterval) {
+            deliver(recognizer.keyUp(at: time, sessionActive: gestures.isSessionActive()))
+        }
+
+        func abort() {
+            recognizer.abort()
+            expiryGeneration += 1
+        }
+
+        /// The manager stopped: settle a pending tap now, since no press or timer will.
+        func finish() {
+            expiryGeneration += 1
+            guard let deadline = recognizer.deadline else { return }
+            recognizer.expire(at: deadline, sessionActive: gestures.isSessionActive())
+                .forEach(gestures.onIntent)
+        }
+
+        private func deliver(_ intents: [KeyGestureRecognizer.Intent]) {
+            intents.forEach(gestures.onIntent)
+            expiryGeneration += 1
+            guard let deadline = recognizer.deadline else { return }
+            let generation = expiryGeneration
+            schedule(max(0, deadline - clock())) { [weak self] in
+                guard let self, self.expiryGeneration == generation else { return }
+                self.deliver(self.recognizer.expire(at: self.clock(),
+                                                    sessionActive: self.gestures.isSessionActive()))
+            }
+        }
     }
 }
