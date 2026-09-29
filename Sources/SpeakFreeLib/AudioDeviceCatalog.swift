@@ -88,10 +88,16 @@ public enum AudioDeviceCatalog {
         cachedDefaultInput?.isBluetooth ?? false
     }
 
+    /// Set on refreshQueue by the first `startCache`.
+    private static var cacheStarted = false
+
     /// Start the background cache: initial refresh plus listeners for device-list and
-    /// default-input changes. Call once, from any thread; never blocks the caller.
+    /// default-input changes. Call from any thread, as often as needed: only the first call
+    /// registers the listeners. Never blocks the caller.
     public static func startCache() {
         refreshQueue.async {
+        guard !cacheStarted else { return }
+        cacheStarted = true
         refreshCacheNow()
         var devicesAddr = address(kAudioHardwarePropertyDevices)
         var defaultAddr = address(kAudioHardwarePropertyDefaultInputDevice)
