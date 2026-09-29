@@ -405,3 +405,13 @@ private extension Result {
         return nil
     }
 }
+
+@MainActor
+final class DictationSessionRetentionInitTests: XCTestCase {
+    func testRetentionConfigInitReplacesTheSavedSettings() {
+        var hostConfig = Config.defaultConfig
+        hostConfig.saveRecordings = FlexBool(false)
+        let session = DictationSession(recorder: AudioRecorder(), retentionConfig: { hostConfig })
+        XCTAssertEqual(session.environment.loadRetentionConfig().saveRecordings?.value, false)
+    }
+}

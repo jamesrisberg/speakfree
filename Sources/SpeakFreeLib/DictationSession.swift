@@ -214,7 +214,7 @@ public final class DictationSession {
     /// When set, `inputLevel` events are reported at this interval while recording.
     public var levelEventInterval: TimeInterval?
 
-    private let environment: Environment
+    let environment: Environment
     private var observers: [(token: UUID, observer: Observer)] = []
     private var stopWaiters: [UUID: [(Result<DictationResult, DictationFailure>) -> Void]] = [:]
 
@@ -326,6 +326,15 @@ public final class DictationSession {
 
     public convenience init(recorder: AudioRecorder, inserter: TextInserter = TextInserter()) {
         self.init(recorder: recorder, inserter: inserter, environment: Environment())
+    }
+
+    /// A session whose finished takes follow `retentionConfig` instead of the saved settings, for
+    /// a host that decides retention itself (for example, never keeping recordings). Runs off main.
+    public convenience init(recorder: AudioRecorder, inserter: TextInserter = TextInserter(),
+                            retentionConfig: @escaping @Sendable () -> Config) {
+        var environment = Environment()
+        environment.loadRetentionConfig = retentionConfig
+        self.init(recorder: recorder, inserter: inserter, environment: environment)
     }
 
     init(recorder: AudioRecorder, inserter: TextInserter, environment: Environment) {
