@@ -153,6 +153,48 @@ class RecordingOverlay {
     /// Visual variant for the prominent banner (config overlayStyle 1-5).
     var style: Int = 1
 
+    /// Where the indicator is anchored (config overlayPosition). Set by AppDelegate
+    /// alongside `style` before every show(), so a Settings change applies to the
+    /// next dictation without a restart.
+    var placement: OverlayPlacement = .default
+
+    /// The edge the current window is pinned to; every reposition/resize keeps it.
+    private var currentAnchor: OverlayAnchor = .center
+    /// Content size behind the current window (the notch treatment pads the window
+    /// out to the camera housing's width, so the two can differ).
+    private var currentContentSize: NSSize = .zero
+
+    /// The locked record-icon entry (style 5) is a centered-canvas animation; the
+    /// notch treatment replaces it with the black housing body, so it is off there.
+    private var usesEmergence: Bool {
+        !placement.isNotch && OverlayContentView.usesEmergenceEntry(style: style)
+    }
+
+    /// Preview seam (`speakfree overlay-preview <placement>`): a synthetic 0…1 speech
+    /// envelope used in place of the mic when no recorder is attached, so the real
+    /// window can be driven through its states without touching the microphone.
+    var previewLevelProvider: (() -> CGFloat)?
+
+    /// Screen geometry seam: tests can inject a synthetic notch/no-notch screen.
+    var screenGeometryProvider: (NSScreen) -> OverlayScreenGeometry = { OverlayScreenGeometry(screen: $0) }
+
+    /// Window size for `content` on `screen` under the current placement.
+    private func windowSize(content: NSSize, on screen: OverlayScreenGeometry) -> NSSize {
+        placement.isNotch ? OverlayLayout.notchWindowSize(content: content, on: screen) : content
+    }
+
+    /// Resolve the window frame for `content` pinned to the placement's anchor for a
+    /// state whose historical anchor is `historical`, and remember both for later
+    /// repositions. The one place window geometry is decided.
+    private func placeWindow(content: NSSize, historical: OverlayAnchor,
+                             on screen: NSScreen) -> NSRect {
+        let geometry = screenGeometryProvider(screen)
+        currentAnchor = placement.anchor(historical: historical)
+        currentContentSize = content
+        return OverlayLayout.frame(size: windowSize(content: content, on: geometry),
+                                   anchor: currentAnchor, on: geometry)
+    }
+
     /// Diagnostic-only: `SPEAKFREE_OVERLAY_LEVELS=1` prints the recalibrated mic
     /// levels each tick so the trigger can be re-verified on a live mic. Off by
     /// default; magnitudes only, never transcript content.
@@ -233,11 +275,16 @@ class RecordingOverlay {
                 let resolved = screens[idx]
                 if resolved !== self.cachedScreen {
                     self.cachedScreen = resolved
-                    let size = win.frame.size
-                    win.setFrame(NSRect(x: resolved.frame.midX - size.width / 2,
-                                        y: resolved.frame.midY - size.height / 2,
-                                        width: size.width, height: size.height),
-                                 display: true)
+                    // Re-derive from the content size: the notch treatment pads the
+                    // window to the housing width, which differs per screen.
+                    let geometry = self.screenGeometryProvider(resolved)
+                    let size = self.windowSize(content: self.currentContentSize, on: geometry)
+                    let frame = OverlayLayout.frame(size: size, anchor: self.currentAnchor,
+                                                    on: geometry)
+                    win.setFrame(frame, display: true)
+                    self.contentView?.frame = NSRect(origin: .zero, size: frame.size)
+                    self.contentView?.notchWidth = geometry.notchWidth
+                    self.contentView?.needsDisplay = true
                 }
             }
         }
@@ -341,6 +388,13 @@ class RecordingOverlay {
         contentView = nil
         self.recorder = recorder
 
+        // Hidden placement: no recording/transcribing indicator at all (the menu-bar
+        // icon still tracks state). Errors still get their banner — a failed record
+        // start with zero feedback is the exact silent failure the loud banner exists
+        // to prevent.
+        let isError = { if case .error = state { return true }; return false }()
+        if !placement.showsIndicator && !isError { return }
+
         // Instant screen pick (no AX IPC on the show path); precise resolution
         // refines async and repositions in the rare multi-display disagreement.
         screenResolved = true
@@ -358,17 +412,17 @@ class RecordingOverlay {
         // reliably means the press didn't land (dead tap / dead app / refused start).
         // Recording glides down to the familiar bottom pill after a beat; errors
         // auto-hide in place.
-        let isError = { if case .error = state { return true }; return false }()
-        let prominent = state == .recording || isError
+        // The notch treatment is a compact black body hanging from the camera
+        // housing; it never uses the large banner or the emergence canvas.
+        let notch = placement.isNotch
+        let prominent = (state == .recording || isError) && !notch
         // Michael's locked entry (2026-08-12) opens as a bare record mark on a fully
         // transparent window, so it needs a canvas big enough for the widest ring
         // pulse — clipping one into a corner arc is the exact artifact the lab was
         // built to avoid.
-        let emergence = prominent && !isError
-            && OverlayContentView.usesEmergenceEntry(style: style)
+        let emergence = prominent && !isError && usesEmergence
         let pillSize: NSSize
         let frame: NSRect
-        let bottomMargin: CGFloat = 48
         if prominent {
             if isError {
                 pillSize = OverlayContentView.errorSize
@@ -377,14 +431,13 @@ class RecordingOverlay {
             } else {
                 pillSize = OverlayContentView.prominentSize
             }
-            frame = NSRect(x: screen.frame.midX - pillSize.width / 2,
-                           y: screen.frame.midY - pillSize.height / 2,
-                           width: pillSize.width, height: pillSize.height)
+            frame = placeWindow(content: pillSize, historical: .center, on: screen)
+        } else if notch {
+            pillSize = OverlayContentView.notchContentSize(for: state)
+            frame = placeWindow(content: pillSize, historical: .top, on: screen)
         } else {
             pillSize = OverlayContentView.pillSize(for: state)
-            frame = NSRect(x: screen.frame.midX - pillSize.width / 2,
-                           y: screen.visibleFrame.origin.y + bottomMargin,
-                           width: pillSize.width, height: pillSize.height)
+            frame = placeWindow(content: pillSize, historical: .bottom, on: screen)
         }
 
         let win = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -396,7 +449,9 @@ class RecordingOverlay {
         // cached shadow reads as a grey ghost rectangle around empty space. The
         // locked design was judged without a drop shadow; keep it that way and put
         // the shadow back when the overlay becomes an ordinary pill again.
-        win.hasShadow = !emergence
+        // The notch body must join the housing seamlessly; a window shadow would
+        // draw a grey line along that seam.
+        win.hasShadow = !emergence && !notch
         win.ignoresMouseEvents = true
         // .fullScreenAuxiliary: without it the overlay is invisible over full-screen
         // apps (2026-07-25 UX audit #11) — exactly where a user can't see the menu bar.
@@ -406,6 +461,8 @@ class RecordingOverlay {
         view.overlayState = state
         view.prominent = prominent && !isError
         view.style = style
+        view.isNotch = notch
+        view.notchWidth = notch ? screenGeometryProvider(screen).notchWidth : nil
         view.recordingStartedAt = Date()
         win.contentView = view
 
@@ -476,20 +533,20 @@ class RecordingOverlay {
         // move to the bottom, no shrink to the spinner pill. The draw path paints the
         // working pulse on the same card; here we just refresh and keep the geometry
         // (and the emergence's no-shadow treatment) untouched.
-        if OverlayContentView.emergenceTranscribing(style: style, state: state) {
+        if usesEmergence && OverlayContentView.emergenceTranscribing(style: style, state: state) {
             view.needsDisplay = true
             return
         }
         // Leaving the recording phase drops the emergence canvas for an ordinary
-        // pill, which wants its shadow back (see show()).
-        if state != .recording { win.hasShadow = true }
+        // pill, which wants its shadow back (see show()). The notch body never has one.
+        if state != .recording && !placement.isNotch { win.hasShadow = true }
 
-        let pillSize = OverlayContentView.pillSize(for: state, streamingText: view.streamingText)
-        let bottomMargin: CGFloat = 48
-        let x = screen.frame.midX - pillSize.width / 2
-        let y = screen.visibleFrame.origin.y + bottomMargin
-        win.setFrame(NSRect(x: x, y: y, width: pillSize.width, height: pillSize.height), display: false)
-        view.frame = NSRect(origin: .zero, size: pillSize)
+        let pillSize = placement.isNotch
+            ? OverlayContentView.notchContentSize(for: state, streamingText: view.streamingText)
+            : OverlayContentView.pillSize(for: state, streamingText: view.streamingText)
+        let frame = placeWindow(content: pillSize, historical: .bottom, on: screen)
+        win.setFrame(frame, display: false)
+        view.frame = NSRect(origin: .zero, size: frame.size)
         view.needsDisplay = true
     }
 
@@ -503,8 +560,8 @@ class RecordingOverlay {
         // small pill at the bottom" corruption. Preserved. The 2026-08-21 change is
         // narrower: during the TRANSCRIBING hold only, a rescue status line ("Rechecking
         // with whisper…") may replace the held card, centered, spinner-marked.
-        if OverlayContentView.emergenceSuppressesStreamingText(style: style,
-                                                               state: view.overlayState) {
+        if usesEmergence && OverlayContentView.emergenceSuppressesStreamingText(
+            style: style, state: view.overlayState) {
             guard view.overlayState == .transcribing else { return }
             view.prominent = false
             win.hasShadow = true
@@ -517,26 +574,27 @@ class RecordingOverlay {
         view.streamingText = text
 
         // Resize the pill if text content changed
-        let newSize = OverlayContentView.pillSize(for: view.overlayState, streamingText: text)
-        let oldSize = OverlayContentView.pillSize(for: view.overlayState, streamingText: oldText)
+        let isNotch = placement.isNotch
+        func contentSize(_ streaming: String) -> NSSize {
+            isNotch
+                ? OverlayContentView.notchContentSize(for: view.overlayState, streamingText: streaming)
+                : OverlayContentView.pillSize(for: view.overlayState, streamingText: streaming)
+        }
+        let newSize = contentSize(text)
+        let oldSize = contentSize(oldText)
         if newSize != oldSize {
-            let x = screen.frame.midX - newSize.width / 2
-            let y: CGFloat
-            if text.isEmpty {
-                // Compact pill at the bottom
-                y = screen.visibleFrame.origin.y + 48
-            } else {
-                // Expanded pill centered on screen
-                y = screen.frame.midY - newSize.height / 2
-            }
+            // Historically: compact pill at the bottom while empty, expanded pill
+            // centered once text arrives. Other placements keep their one anchor.
+            let frame = placeWindow(content: newSize, historical: text.isEmpty ? .bottom : .center,
+                                    on: screen)
 
             // Animate the size change smoothly
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.15
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                win.animator().setFrame(NSRect(x: x, y: y, width: newSize.width, height: newSize.height), display: true)
+                win.animator().setFrame(frame, display: true)
             }
-            view.frame = NSRect(origin: .zero, size: newSize)
+            view.frame = NSRect(origin: .zero, size: frame.size)
         }
 
         view.needsDisplay = true
@@ -573,18 +631,18 @@ class RecordingOverlay {
         // The emergence entry has no settle phase: its end state IS the shipped
         // purple pill at 1.2×, which stays put and keeps tracking speech (Michael:
         // "once the lines are created I want it to go back to what it was").
-        guard !OverlayContentView.usesEmergenceEntry(style: style) else { return }
+        // The notch body is already compact and has no banner phase to settle from.
+        guard !usesEmergence, !placement.isNotch else { return }
         let generation = showGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
             guard let self = self, self.showGeneration == generation,
                   let win = self.window, let view = self.contentView,
                   view.overlayState == .recording, view.settleProgress < 1 else { return }
             view.settleProgress = 1
-            let center = CGPoint(x: win.frame.midX, y: win.frame.midY)
-            let size = Self.settledSize
-            let target = NSRect(x: center.x - size.width / 2,
-                                y: center.y - size.height / 2,
-                                width: size.width, height: size.height)
+            // In place: same center when centered, same resting edge otherwise.
+            let target = OverlayLayout.resized(win.frame, to: Self.settledSize,
+                                               anchor: self.currentAnchor)
+            self.currentContentSize = Self.settledSize
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.30
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -651,7 +709,7 @@ class RecordingOverlay {
         // at 30Hz (its smoothing, jitter period and travel cadence are tuned for
         // that rate, and "exactly as shipped" is the requirement for the steady
         // state), so the extra frames are pure redraw.
-        let emergence = OverlayContentView.usesEmergenceEntry(style: style)
+        let emergence = usesEmergence
         let hz: Double = emergence ? 60.0 : 30.0
         let stateEvery: UInt64 = emergence ? 2 : 1
         frameCount = 0
@@ -683,6 +741,13 @@ class RecordingOverlay {
                             "overlay-level: rms %.4f floor %.4f thr %.4f audioLevel %.3f heardSpeech %@",
                             rms, view.speechGate.noiseFloor, view.speechGate.onsetThresholdRMS,
                             view.audioLevel, view.heardSpeech ? "Y" : "n"))
+                    }
+                } else if let preview = self.previewLevelProvider {
+                    // Inert preview: the envelope is already in audioLevel space.
+                    view.audioLevel = preview()
+                    if !view.heardSpeech && view.onsetDetector.update(audioLevel: view.audioLevel) {
+                        view.heardSpeech = true
+                        view.speechStartedAt = Date()
                     }
                 }
                 // The per-bar waveform state used to advance inside drawBars, which
@@ -741,6 +806,12 @@ class OverlayContentView: NSView {
     var renderElapsedOverride: TimeInterval?
     /// Visual variant (config `overlayStyle` 1–5); drawing dispatches on it.
     var style: Int = 1
+    /// Notch treatment (config `overlayPosition: notch`): the pill's purple card is
+    /// replaced by a black body that reads as the camera housing extending downward.
+    var isNotch = false
+    /// Width of the camera housing on the overlay's screen; nil when it has none
+    /// (the body then hangs from the menu bar with softly rounded top corners).
+    var notchWidth: CGFloat?
 
     /// Which variant gets Michael's locked record-icon entry (2026-08-12).
     ///
@@ -855,6 +926,22 @@ class OverlayContentView: NSView {
         return NSSize(width: max(340, span), height: span)
     }()
 
+    /// Content size for the notch treatment. Same as the pill for recording and
+    /// transcribing; errors are sized to their message (the 400×96 center-screen
+    /// error card would look absurd hanging from the housing).
+    static func notchContentSize(for state: RecordingOverlay.OverlayState, streamingText: String = "") -> NSSize {
+        if case .error(let message) = state {
+            let width = ceil((notchErrorText(message) as NSString).size(withAttributes: [
+                .font: notchErrorFont,
+            ]).width)
+            return NSSize(width: min(480, width + hPadding * 2), height: 44)
+        }
+        return pillSize(for: state, streamingText: streamingText)
+    }
+
+    private static let notchErrorFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    private static func notchErrorText(_ message: String) -> String { "\u{26A0}\u{FE0F} \(message)" }
+
     static func pillSize(for state: RecordingOverlay.OverlayState, streamingText: String = "") -> NSSize {
         if case .error = state { return errorSize }
         let barsWidth = CGFloat(barCount) * dotSize + CGFloat(barCount - 1) * barGap
@@ -931,6 +1018,11 @@ class OverlayContentView: NSView {
 
         let rect = bounds
         let pillPath = CGPath(roundedRect: rect, cornerWidth: Self.cornerRadius, cornerHeight: Self.cornerRadius, transform: nil)
+
+        if isNotch {
+            drawNotchBody(ctx: ctx, rect: rect)
+            return
+        }
 
         // Error banner: red gradient, warning glyph, message. Center-screen, loud.
         if case .error(let message) = overlayState {
@@ -1670,7 +1762,7 @@ class OverlayContentView: NSView {
         let effectiveMaxHeight = compressed ? Self.compressedMaxBarHeight : Self.maxBarHeight
 
         // Bars are left-aligned from the horizontal padding in both layouts.
-        let startX: CGFloat = Self.hPadding
+        let startX: CGFloat = rect.minX + Self.hPadding
         let centerY: CGFloat = rect.midY
 
         ctx.setFillColor(color.cgColor)
@@ -1806,5 +1898,71 @@ class OverlayContentView: NSView {
         NSGraphicsContext.current?.restoreGraphicsState()
 
         ctx.restoreGState()
+    }
+
+    // MARK: - Notch treatment (config overlayPosition: notch)
+
+    /// The black body hanging from the camera housing. The same content the bottom
+    /// pill shows — bars, spinner, status line, live preview, error text — on a black
+    /// ground that joins the notch with no seam. Never the large banner or the
+    /// emergence canvas: the body IS the record-start signal here.
+    private func drawNotchBody(ctx: CGContext, rect: NSRect) {
+        let bodyPath = OverlayLayout.notchBodyPath(bounds: rect, notchWidth: notchWidth)
+        ctx.addPath(bodyPath)
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fillPath()
+
+        if hideContents { return }
+
+        if case .error(let message) = overlayState {
+            let text = NSAttributedString(string: Self.notchErrorText(message), attributes: [
+                .font: Self.notchErrorFont,
+                .foregroundColor: NSColor(red: 1.0, green: 0.45, blue: 0.45, alpha: 1.0),
+            ])
+            let size = text.boundingRect(
+                with: NSSize(width: rect.width - Self.hPadding * 2, height: rect.height),
+                options: [.usesLineFragmentOrigin]).size
+            ctx.saveGState()
+            ctx.addPath(bodyPath)
+            ctx.clip()
+            text.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2,
+                                 width: size.width, height: size.height))
+            ctx.restoreGState()
+            return
+        }
+
+        let isTranscribing = overlayState == .transcribing
+        if isTranscribing {
+            if streamingText.isEmpty {
+                drawSpinner(ctx: ctx, rect: rect)
+            } else {
+                drawStatusLine(ctx: ctx, rect: rect, pillPath: bodyPath)
+            }
+            return
+        }
+
+        if !streamingText.isEmpty {
+            // Live preview: compressed bars along the top, text below (pill layout).
+            let barsRect = NSRect(x: rect.minX, y: rect.maxY - Self.compressedBarsAreaHeight,
+                                  width: rect.width, height: Self.compressedBarsAreaHeight)
+            drawBars(ctx: ctx, rect: barsRect, color: NSColor.white.withAlphaComponent(0.75), compressed: true)
+            drawStreamingText(ctx: ctx, rect: rect)
+            return
+        }
+
+        // Recording: record dot + live bars, centered as one group so the body reads
+        // the same whether it is the housing's width or the pill's.
+        let dotRadius: CGFloat = 4
+        let dotGap: CGFloat = 8
+        let barsWidth = CGFloat(Self.barCount) * Self.dotSize + CGFloat(Self.barCount - 1) * Self.barGap
+        let groupWidth = dotRadius * 2 + dotGap + barsWidth
+        let groupX = rect.midX - groupWidth / 2
+        let blink = 0.7 + 0.3 * sin(CGFloat(tick) * 0.15)
+        drawRecordCircle(ctx, center: CGPoint(x: groupX + dotRadius, y: rect.midY),
+                         radius: dotRadius, alpha: blink)
+        // drawBars starts at rect.minX + hPadding, so shift the rect back by hPadding.
+        let barsRect = NSRect(x: groupX + dotRadius * 2 + dotGap - Self.hPadding, y: rect.minY,
+                              width: barsWidth + Self.hPadding * 2, height: rect.height)
+        drawBars(ctx: ctx, rect: barsRect, color: NSColor.white.withAlphaComponent(0.85), compressed: false)
     }
 }

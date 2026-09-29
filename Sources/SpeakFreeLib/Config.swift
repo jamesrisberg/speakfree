@@ -25,6 +25,11 @@ public struct Config: Codable {
     public var screenContext: FlexBool?
     /// Recording banner visual variant 1-5 (2026-07-25 design shotgun); nil = 1.
     public var overlayStyle: Int?
+    /// Where the recording indicator appears: "center" (default), "bottom", "notch", or
+    /// "hidden". nil = center, which is the historical behavior. JSON key: "overlayPosition".
+    /// Decoding is lenient (unknown values resolve to center) so a bad value can never make
+    /// the whole config unparseable. Resolve through `effectiveOverlayPlacement`.
+    public var overlayPosition: OverlayPlacement?
     // Deprecated 2026-06-11: the correction learner was removed (it polluted the
     // glossary with truncations and quote-style noise). Key is kept so old configs
     // decode and the value round-trips, but nothing reads it.
@@ -99,6 +104,9 @@ public struct Config: Codable {
     /// drift ("Settings says Automatic & Spoken while dictation runs Automatic Only")
     /// happened, and how the CLI drifted from the app.
     public var effectivePunctuationMode: PunctuationMode { spokenPunctuation ?? .off }
+
+    /// Single resolution of a missing `overlayPosition` key: the historical centered banner.
+    public var effectiveOverlayPlacement: OverlayPlacement { overlayPosition ?? .default }
 
     // MARK: - Product defaults (Michael, 2026-06-11)
     //

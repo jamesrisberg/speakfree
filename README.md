@@ -49,6 +49,7 @@ Click the menu bar icon → **Settings** to change everything in-app:
 | **Engine & model** | Parakeet English (default), or any Whisper size (see below) |
 | **Punctuation** | Hybrid (default), Off, Spoken words |
 | **Key Mode** | Hold (default), Toggle |
+| **Indicator** | Center of screen (default), Bottom of screen, Under the notch, Hidden |
 | **Past Recordings** | Keep everything (default), or cap at the last 10–100 |
 
 Click **Help** in the menu for plain-English explanations of every setting.
