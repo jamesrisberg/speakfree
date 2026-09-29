@@ -112,6 +112,26 @@ final class SettingsViewModelTests: XCTestCase {
         XCTAssertEqual(saved.modelPath, "/custom/model/path.bin")
     }
 
+    // MARK: - Local API dictation control
+
+    func testLocalAPIAllowControlDefaultsOffAndRoundTrips() throws {
+        let json = """
+        {
+            "hotkey": {"keyCode": 63, "modifiers": []},
+            "modelSize": "base.en",
+            "language": "en",
+            "localAPI": true
+        }
+        """.data(using: .utf8)!
+        let vm = SettingsViewModel(config: try Config.decode(from: json))
+        XCTAssertTrue(vm.localAPIEnabled)
+        XCTAssertFalse(vm.localAPIAllowControl, "dictation control must be a separate opt-in")
+        XCTAssertEqual(vm.toConfig().localAPIAllowControl?.value, false)
+
+        vm.localAPIAllowControl = true
+        XCTAssertEqual(vm.toConfig().localAPIAllowControl?.value, true)
+    }
+
     // MARK: - Default values for nil optionals
 
     func testInitDefaultsNilOptionals() throws {

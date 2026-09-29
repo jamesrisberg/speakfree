@@ -53,6 +53,33 @@ Click the menu bar icon → **Settings** to change everything in-app:
 
 Click **Help** in the menu for plain-English explanations of every setting.
 
+## Local API (experimental)
+
+Off by default. Turn on **Local Transcription API** under Settings → Advanced. The server listens on `127.0.0.1:5765` (`localAPIPort`), refuses anything that is not from this Mac, rejects non-loopback `Host` headers, and, when `localAPIToken` is set in `~/.config/speakfree/config.json`, requires `Authorization: Bearer <token>` on every request.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /v1/audio/transcriptions` | OpenAI-compatible file transcription (multipart `file`, optional `response_format=text`) |
+
+**Dictation control** is a second opt-in (**Dictation Control** in Settings, `localAPIAllowControl` in config), because it turns the microphone on. With it off, these routes answer `403`.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /v1/dictation/start` | Start recording. JSON body: `destination` = `"caller"` (default; text comes back over the API and is never typed) or `"cursor"` (typed like a hotkey dictation); optional `engine` (must match the active engine, else `422`); optional `timeout_ms` (auto-stop, default 300000, max 1800000). Returns `{id, state, destination}`. `409` if a dictation is already in progress. |
+| `POST /v1/dictation/{id}/stop` | Stop and finalize. Waits for transcription, then returns the session; for `caller` it includes `raw` (engine output), `processed` (punctuation and glossary applied) and `styled` (what would have been typed). |
+| `POST /v1/dictation/{id}/cancel` | Discard the take. While transcribing, only `caller` sessions can be cancelled (their text is dropped). |
+| `GET /v1/dictation/{id}` | Session state: `recording`, `transcribing`, `done`, `error`, or `cancelled`. |
+| `GET /v1/events` | Server-sent events for every dictation, hotkey ones included (`id` is `null` for those). `event: state` with `{"state", "id", "error"?}` (`idle`, `recording`, `transcribing`, `done`, `error`, `cancelled`), and `event: level` with `{"level": 0..1}` about 10 times a second while recording. Events never contain transcript text. |
+
+```bash
+id=$(curl -s -X POST localhost:5765/v1/dictation/start -d '{"destination":"caller"}' | jq -r .id)
+# ...speak...
+curl -s -X POST localhost:5765/v1/dictation/$id/stop   # {"state":"done","styled":"…",…}
+curl -N localhost:5765/v1/events                         # live state + input level
+```
+
+API dictations use the same recording path as the hotkey (buffering, silence checks, text cleanup, the recording banner, and your recordings setting). Pressing the hotkey during an API dictation stops it the same way it would stop your own.
+
 ## Microphones — and the AirPods problem
 
 The built-in Mac microphone is the default because it transcribes most reliably. You can pin any mic in **Settings → Microphone**; a pinned mic stays pinned even when you join a call or plug in headphones.
