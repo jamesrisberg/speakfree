@@ -10,46 +10,32 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     var statusBar: StatusBarController!
     var hotkeyManager: HotkeyManager?
     var recorder: AudioRecorder!
-    /// Transfers to the finalization task; closing the writer alone does not end file use.
-    private var recordingActivityLease: RecordingActivity.Lease?
-    var transcriber: Transcriber!
-    var inserter: TextInserter!
-    var config: Config!
-    private let _isPressed = OSAllocatedUnfairLock(initialState: false)
-    var isPressed: Bool {
-        get { _isPressed.withLock { $0 } }
-        set { _isPressed.withLock { $0 = newValue } }
+    var transcriber: Transcriber! {
+        didSet {
+            let transcriber = transcriber
+            onMainActor { [weak self] in self?.session?.transcriber = transcriber }
+        }
     }
-    var isReady = false
+    var inserter: TextInserter!
+    var config: Config! {
+        didSet {
+            guard let config else { return }
+            let configuration = DictationConfiguration(config: config)
+            onMainActor { [weak self] in self?.session?.configuration = configuration }
+        }
+    }
+    /// The recording flow. Hotkey presses, the local API and the menu all drive this one session;
+    /// the app presents what it reports (`present(_:)`).
+    private(set) var session: DictationSession?
+    var isReady = false {
+        didSet { updateSessionAvailability() }
+    }
     public var lastTranscription: String?
     private var recordingOverlay = RecordingOverlay()
     private var settingsViewModel: SettingsViewModel?
     private var localAPIServer: LocalAPIServer?
-    private var recordingStyleMode: TextPostProcessor.StyleMode = .none
-    /// Frontmost app at record start — where the dictation will land. Persisted in
-    /// .meta.json so the edit-feedback batch can find the final artifact to diff.
-    private var recordingTargetBundleID: String?
-
-    // MARK: - Edit Mode seams (Phase 2 wires these; nil/false in Phase 1 = no behavior change)
-    //
-    /// Set at record-start by the edit session (Phase 2) so finalize knows this segment belongs to an
-    /// open edit session. nil for every hold/toggle dictation, which then resolves to
-    /// FinalizeDestination.insertImmediately — byte-identical to pre-Edit-Mode.
-    var pendingEditFinalizeTarget: (sessionID: UUID, segmentID: UUID)?
-    /// Delivers a finalized edit segment to the open session INSTEAD of inserting it (C1).
-    var editFinalizeSink: ((EditFinalizePayload) -> Void)?
-    // MARK: - Local API dictation control
-    //
-    /// The local-API session this take belongs to (nil for hotkey dictations). Set at record-start
-    /// by `startAPIDictation`, snapshotted and cleared in finalizeRecording / abort. A `.caller`
-    /// destination resolves to FinalizeDestination.returnToCaller and never reaches the inserter.
-    var pendingAPISession: (id: UUID, destination: DictationAPIDestination)?
-    /// Session registry + /v1/events fan-out. Every dictation reports its progress here.
-    private(set) lazy var dictationControl: DictationControlCenter = {
-        let center = DictationControlCenter()
-        center.driver = self
-        return center
-    }()
+    /// Session registry + /v1/events fan-out for the local API. It observes every take.
+    private(set) lazy var dictationControl = DictationControlCenter()
     /// True while an edit session window is open — extends the config-reload defer (MAP §8).
     var editSessionOpenProbe: (() -> Bool)?
     /// Routes an Edit-mode fn-tap through the EditSessionController (Phase 2). nil = fall back to
@@ -88,20 +74,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var updaterController = SPUStandardUpdaterController(
         startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
 
-    // R1: focus capture (the AXUIElement focused at record-start, used to refocus before
-    // pasting, plus the cursor-context text passed to whisper as a prompt). The AX read now
-    // runs OFF-MAIN so record-start never blocks on an unresponsive frontmost app's AX tree:
-    // `begin()` at record-start, the background reader `publish`es when it lands, and
-    // finalize `consume(waitingUpTo:)`s it (waiting briefly only if still in flight — never
-    // on the start path; nil on timeout, exactly the old AX-timeout semantics).
-    private let focusCapture = FocusCaptureBox<(AXUIElement?, String?)>()
-    // Screen OCR text captured at recording start (opt-in). Written only on main via
-    // generation-token check, so no lock needed.
-    private var screenContextText: String?
-    // Generation token: bumped at recording start AND end/cancel. The OCR background task
-    // captures the UUID at dispatch time and writes back only if the token still matches,
-    // discarding stale results from previous recordings.
-    private var screenCaptureGeneration: UUID = UUID()
     // Last time the transcription-failure alert was shown; a persistently broken engine
     // fails every attempt, and the modal is throttled to one per 5 minutes (main-only).
     private var lastTranscriptionFailureAlert: Date?
@@ -114,63 +86,20 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private var sigtermSource: DispatchSourceSignal?
     // Draining after SIGTERM (2026-07-25): new recordings are refused while waiting to
     // exit — one started post-SIGTERM races the exit and its audio dies in memory.
-    private var isTerminating = false
-    // In-recording dead-audio watchdog + idle tap-health poll (2026-07-25). Main-only.
-    private var recordingWatchdogTimer: Timer?
-    private var watchdogWarnedDeadAudio = false
-    private var watchdogSilentTicks = 0
+    private var isTerminating = false {
+        didSet { updateSessionAvailability() }
+    }
+    // Idle tap-health poll (2026-07-25). Main-only.
     private var tapHealthTimer: Timer?
-    // Tail of the last successful insertion (2026-07-15): feeds the cursor-context
-    // fallback for AX-opaque editors. Main-only.
-    private var lastInsertionTail: String?
-    private var lastInsertionBundleID: String?
-    private var lastInsertionAt: Date?
-    private var lastInsertionElement: AXUIElement?
-    private var lastInsertionInteractionGeneration: UInt64?
-    private let userInteractionGeneration = OSAllocatedUnfairLock(initialState: UInt64(0))
     // L1: a config reload that lands while a dictation is in flight (fn held) must NOT mutate live
     // dictation state — it would (a) rebuild the HotkeyManager mid-press (recreating the event tap
     // loses the pending key-release, so the recording never stops and the next utterance merges
     // in), (b) swap the transcriber, finalizing THIS utterance on the wrong engine, and (c) flip
     // config.toggleMode so a Hold→Toggle switch mid-press makes handleKeyUp return early and strand
     // the running recording. So the ENTIRE reloadConfig is deferred by setting this flag; it is
-    // re-run in full the moment the dictation ends (finalize / key-up / abort). The old
-    // pendingHotkeyReload folded into this — the hotkey rebuild happens inside the deferred
-    // reloadConfig, same as when not pressed. Main-only.
+    // re-run in full the moment the dictation ends (finalize / key-up / abort). The hotkey rebuild
+    // happens inside the deferred reloadConfig, same as when not pressed. Main-only.
     private var pendingConfigReload = false
-
-    // Adaptive post-buffer (T2.1): poll trailing audio after key release. The policy requires
-    // 90ms of current trailing silence, otherwise waits 220ms, extending up to 1.2s when trailing
-    // energy crosses the speech threshold. This timer feeds it RMS windows from the live recorder.
-    private var postBufferTimer: Timer?
-    private var postBufferGeneration: UInt64 = 0
-    /// The current press resumed a take whose previous hold had already been released.
-    private var continuedReleasedTake = false
-    /// Window cadence the post-buffer poll uses (matches PostBufferPolicy's default window grain).
-    private let postBufferWindowMs: Double = 30.0
-
-    // Streaming transcription: periodic inference during recording
-    private var streamingTimer: Timer?
-    private var isStreamingInFlight = false  // prevents overlapping inference runs
-    /// Streaming-overlay text assembler. Owns the "committed" display text (sentences that
-    /// have ended and won't reflow) and the stable-append logic, extracted to
-    /// `StreamingTextAssembler` so the assembly is unit-testable. Behavior is byte-identical
-    /// to the prior inline `committedStreamingText` + `buildStableDisplayText`.
-    private var streamingAssembler = StreamingTextAssembler()
-    /// Monotonically-increasing token bumped every time streaming stops. Stale partial-result
-    /// callbacks that arrive on main after recording ended compare against this and are dropped.
-    private var streamingGeneration: UInt = 0
-
-    // T2.3 — Reuse last streaming partial. These three capture the LAST completed streaming pass so
-    // `finalizeRecording` can (when StreamingReuse.decide approves) skip the redundant final
-    // inference and route this saved raw partial through TextPipeline instead. Reset on every
-    // streaming start/stop. Written on the main queue only.
-    /// Raw engine text the last completed streaming pass returned (pre-TextPipeline). "" = none.
-    private var lastStreamingRawPartial: String = ""
-    /// Recorder sample count the last streaming pass ran over.
-    private var lastStreamingSampleCount: Int = 0
-    /// `CFAbsoluteTime` the last streaming pass completed (0 = none yet).
-    private var lastStreamingCompletedAt: Double = 0
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         // Cap ALL AX messaging process-wide at 0.5 s. The AX default is an INDEFINITE block
@@ -182,6 +111,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         statusBar = StatusBarController()
         recorder = AudioRecorder()
         inserter = TextInserter()
+        makeSession()
         installGracefulTermination()
 
         // Device catalog cache: the ONLY CoreAudio the main thread ever sees. Refreshes
@@ -674,7 +604,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleRecordingAbort()
             },
             onUserInteraction: { [weak self] interaction in
-                DispatchQueue.main.async { self?.noteUserInteraction(interaction) }
+                self?.onMainActor { self?.session?.noteUserInteraction(interaction) }
             }
         )
 
@@ -682,8 +612,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         // Tap-health poll (2026-07-25 audit: a dead event tap was UNDETECTABLE —
         // the only health check was gated behind a successful keypress). Every 30s,
         // verify and re-arm the tap so "press fn, nothing happens" gets fixed before
-        // the user hits it. NOT gated on isPressed (2026-08-11): a stranded take —
-        // release lost during a tap outage — keeps isPressed true indefinitely, so an
+        // the user hits it. NOT gated on a held take (2026-08-11): a stranded take —
+        // release lost during a tap outage — keeps the session recording indefinitely, so an
         // idle-only poll was disabled during exactly the failure it guards. Running it
         // mid-take is safe: ensureTapHealthy reconciles only when it actually repaired
         // something, so a healthy take in progress is never touched.
@@ -772,7 +702,12 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The engine id ("whisper" | "parakeet") of the currently-built transcriber. Tracked here
     /// so reloadConfig can detect an engine switch without reaching into transcriber.engine.*.
-    private(set) var activeEngineID: String = "whisper"
+    private(set) var activeEngineID: String = "whisper" {
+        didSet {
+            let engineID = activeEngineID
+            onMainActor { [weak self] in self?.session?.engineID = engineID }
+        }
+    }
 
     /// True once setupInner() has run to completion (hotkey listener started).
     /// While false, the app is in the "no model" state and reloadConfig triggers a full restart.
@@ -823,7 +758,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         // (MAP §8): swapping the transcriber/hotkey or flipping Key Mode under an open session would
         // strand its segments and change the hotkey out from under it. Every dictation-end path (and
         // Phase 2's session-close path) re-runs the reload once via performPendingConfigReloadIfNeeded.
-        if isPressed || postBufferTimer != nil || (editSessionOpenProbe?() ?? false) {
+        if (session?.isCapturing ?? false) || (editSessionOpenProbe?() ?? false) {
             pendingConfigReload = true
             DiagnosticLogger.shared.log("Config: reload deferred — dictation or edit session in flight")
             return
@@ -1103,53 +1038,19 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             onKeyUp: { [weak self] in self?.handleKeyUp() },
             onAbort: { [weak self] in self?.handleRecordingAbort() },
             onUserInteraction: { [weak self] interaction in
-                DispatchQueue.main.async { self?.noteUserInteraction(interaction) }
+                self?.onMainActor { self?.session?.noteUserInteraction(interaction) }
             }
         )
     }
 
-    private func noteUserInteraction(_ interaction: HotkeyManager.CursorInteraction) {
-        func invalidate() {
-            userInteractionGeneration.withLock { generation in
-                generation &+= 1
-            }
-        }
-
-        guard let bundleID = lastInsertionBundleID,
-              NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleID,
-              let tail = lastInsertionTail else {
-            invalidate()
-            return
-        }
-
-        let pastedText = interaction == .paste
-            ? NSPasteboard.general.string(forType: .string) : nil
-        guard let updatedTail = HotkeyManager.updatedCursorTail(
-            tail, after: interaction, pastedText: pastedText) else {
-            invalidate()
-            return
-        }
-
-        // We now know the cursor tail from the actual edits, even if AX cannot expose the
-        // editor. Clear the old AX identity (Electron may vend unstable wrapper objects), keep
-        // only the bounded suffix, and refresh the fallback freshness window.
-        lastInsertionTail = updatedTail
-        lastInsertionAt = Date()
-        lastInsertionElement = nil
-    }
-
-    private func currentUserInteractionGeneration() -> UInt64 {
-        userInteractionGeneration.withLock { $0 }
-    }
-
     /// L1: apply a config reload that was deferred because a dictation was in flight when
-    /// reloadConfig was called. Called from every path that ends a dictation (finalizeRecording,
-    /// handleKeyUp, handleRecordingAbort); the guard-then-clear makes it fire once and is
-    /// idempotent, so overlapping end paths don't double-reload. reloadConfig reloads fresh
+    /// reloadConfig was called. Called from every path that ends a dictation (the session's
+    /// `captureEnded` and `cancelled`, and handleKeyUp); the guard-then-clear makes it fire once
+    /// and is idempotent, so overlapping end paths don't double-reload. reloadConfig reloads fresh
     /// Config.load() state from disk. Key-up alone does not end the take: a pending post-buffer
-    /// keeps the reload deferred until its finalizer relinquishes the capture boundary.
+    /// keeps the reload deferred until finalize relinquishes the capture boundary.
     private func performPendingConfigReloadIfNeeded() {
-        guard pendingConfigReload, postBufferTimer == nil else { return }
+        guard pendingConfigReload, !(session?.isTrailing ?? false) else { return }
         pendingConfigReload = false
         DiagnosticLogger.shared.log("Config: applying deferred reload — dictation finished")
         reloadConfig()
@@ -1254,7 +1155,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleKeyDown() {
-        guard isReady, !isTerminating else { return }
+        guard isReady, !isTerminating, let session else { return }
+        let isPressed = session.isRecording
 
         // Resolve Key Mode through the one shared property (KeyMode.swift), never a site-local
         // `config.toggleMode?.value ?? false` — that is exactly the drift `effectiveKeyMode` and
@@ -1313,404 +1215,252 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Guards `lastLiveAXContextByApp`, written from the background capture queue.
-    private static let liveAXContextLock = NSLock()
-    /// bundleID -> the last live-AX cursor context we accepted for that app.
-    private static var lastLiveAXContextByApp: [String: String] = [:]
+    // MARK: - Dictation session
 
-    /// Record this live-AX context and report whether it is a REPEAT for the same app.
-    ///
-    /// 2026-07-26 — the three Electron trust gates in `readTextBeforeCursor` all reject things
-    /// that are too BIG (cursor not at end, >1200 chars, >4 newlines). They were built to keep
-    /// out the VS Code terminal scrollback. What actually got through was too SMALL: on 07-26,
-    /// 83 of the day's reads in VS Code returned one of exactly two constant strings (22 and 32
-    /// chars), while every genuine context length appeared once or twice. speakfree read that
-    /// fixed UI string as "the text before your cursor" and therefore prepended a space and
-    /// lowercased the first word — 57 wrongly-lowercased dictations that day, 63 the day before,
-    /// and 0 on the two days before the Electron AX unlock shipped.
-    ///
-    /// A real cursor context changes: he types, or our own insertion lands in the field. A value
-    /// byte-identical to the previous one for the same app is chrome, not his text. Rejecting it
-    /// falls back to no-context, which disables exactly the two features that were misfiring,
-    /// and only for the reads that were wrong.
-    static func liveAXContextIsRepeat(_ context: String, bundleID: String?) -> Bool {
-        let key = bundleID ?? "?"
-        liveAXContextLock.lock()
-        defer { liveAXContextLock.unlock() }
-        let isRepeat = lastLiveAXContextByApp[key] == context
-        lastLiveAXContextByApp[key] = context
-        return isRepeat
-    }
-
-    /// Test seam — the table is process-global, so tests must be able to clear it.
-    static func resetLiveAXContextMemory() {
-        liveAXContextLock.lock()
-        lastLiveAXContextByApp.removeAll()
-        liveAXContextLock.unlock()
-    }
-
-    static func liveCursorContext(_ context: String?, isElectronClass: Bool) -> String? {
-        isElectronClass ? nil : context
-    }
-
-    private func captureFocusedElement() {
-        // R1: fire-and-commit. The AX read used to block the main thread up to 0.5s at
-        // record-START — and an unresponsive frontmost app would stall it long enough for
-        // macOS to disable our event tap. It now runs on the background queue and publishes
-        // into `focusCapture`; finalize consumes the result (waiting briefly only if it is
-        // still in flight). Record-start no longer waits on it at all. Pre-roll (500ms)
-        // means no audio is lost by starting the recorder before the read completes.
-        let token = focusCapture.begin()
-        // Snapshot the main-only fallback inputs now (we're on main) so the background
-        // reader can compute the Electron cursor-context fallback without touching main state.
-        let lastTail = lastInsertionTail
-        let lastBundle = lastInsertionBundleID
-        let lastAt = lastInsertionAt
-        let lastElement = lastInsertionElement
-        let lastInteractionGeneration = lastInsertionInteractionGeneration
-        let interactionGenerationAtStart = currentUserInteractionGeneration()
-        let frontApp = NSWorkspace.shared.frontmostApplication
-        let frontBundle = frontApp?.bundleIdentifier
-        // Resolve the Electron classification on main, where `frontmostApplication` is
-        // authoritative, rather than re-reading it from the background reader below.
-        let electronClass = TextInserter.prefersClipboardPaste(app: frontApp)
-        let avoidLiveWindowContext = TextInserter.shouldAvoidLiveWindowContext(
-            bundleID: frontBundle, bundleURL: frontApp?.bundleURL)
-
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            var capturedElement: AXUIElement?
-            var capturedContext: String?
-            let systemWide = AXUIElementCreateSystemWide()
-            var elementRef: CFTypeRef?
-            // Electron-class apps get the trust gates on EVERY read (2026-07-25:
-            // AXManualAccessibility persists per-app once flipped, so subsequent
-            // reads succeed on this FIRST attempt — the gates must not live only
-            // on the unlock-retry path). Native apps keep full-fidelity context.
-            let result = avoidLiveWindowContext
-                ? AXError.cannotComplete
-                : AXUIElementCopyAttributeValue(
-                    systemWide, kAXFocusedUIElementAttribute as CFString, &elementRef)
-            if result == .success, let element = elementRef {
-                // swiftlint:disable:next force_cast
-                let axElement = element as! AXUIElement
-                capturedElement = axElement
-                if !electronClass {
-                    capturedContext = Self.liveCursorContext(
-                        self?.readTextBeforeCursor(in: axElement),
-                        isElectronClass: electronClass)
-                }
-            }
-
-            // Electron AX unlock (2026-07-25): Electron apps ship with their AX tree
-            // DISABLED and expose the app-level `AXManualAccessibility` switch to turn
-            // it on without VoiceOver. Without it, typed-then-dictate in Superhuman/
-            // VS Code has no cursor context, so the mid-sentence-lowercase feature
-            // can't fire ("Search for X " + dictation came out capitalized). Flip the
-            // switch on first failure, give the tree a beat to build, retry once.
-            // We're on a background queue — the wait never touches main; pre-roll
-            // covers the audio. Idempotent and harmless on non-Electron apps.
-            if !electronClass, capturedContext == nil,
-               let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier {
-                let appEl = AXUIElementCreateApplication(pid)
-                AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString,
-                                             kCFBooleanTrue)
-                Thread.sleep(forTimeInterval: 0.25)
-                var retryRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(systemWide,
-                                                 kAXFocusedUIElementAttribute as CFString,
-                                                 &retryRef) == .success,
-                   let element = retryRef {
-                    // swiftlint:disable:next force_cast
-                    let axElement = element as! AXUIElement
-                    capturedElement = axElement
-                    capturedContext = self?.readTextBeforeCursor(in: axElement,
-                                                                 requireCursorAtEnd: true)
-                    if capturedContext != nil {
-                        DiagnosticLogger.shared.log(
-                            "captureFocusedElement: AXManualAccessibility unlock succeeded (cursor at end)")
-                    }
-                }
-            }
-
-            // Repeat-value gate (2026-07-26). A live-AX context identical to the previous read
-            // for this app is fixed UI chrome, not his cursor — see liveAXContextIsRepeat.
-            if let live = capturedContext,
-               AppDelegate.liveAXContextIsRepeat(live, bundleID: frontBundle) {
-                DiagnosticLogger.shared.log(
-                    "captureFocusedElement: discarded repeated live-AX context (\(live.count) chars, "
-                    + "identical to the previous read for \(frontBundle ?? "?")) — treating as no context")
-                capturedContext = nil
-            }
-
-            // Electron editors (VS Code) expose no AXValue — fall back to the tail of our
-            // own last insertion when it plausibly still sits before the cursor, so the
-            // mid-sentence-lowercase and prepend-space features keep working there.
-            var contextSource = capturedContext != nil ? "liveAX" : "none"
-            if capturedContext == nil {
-                let userInteracted = lastInteractionGeneration.map {
-                    $0 != interactionGenerationAtStart
-                } ?? false
-                let focusedElementMatches: Bool?
-                if let lastElement, let capturedElement {
-                    focusedElementMatches = CFEqual(lastElement, capturedElement)
-                } else {
-                    focusedElementMatches = nil
-                }
-                let fallback = FinalizePipeline.fallbackCursorContext(
-                    lastInsertedTail: lastTail,
-                    lastInsertedBundleID: lastBundle,
-                    lastInsertedAt: lastAt,
-                    frontmostBundleID: frontBundle,
-                    now: Date(),
-                    userInteractedSinceInsertion: userInteracted,
-                    focusedElementMatches: focusedElementMatches)
-                if let fallback {
-                    capturedContext = fallback
-                    contextSource = "fallbackTail"
-                    DiagnosticLogger.shared.log(
-                        "captureFocusedElement: AX gave no context — using tail of last insertion (\(fallback.count) chars)")
-                } else if lastTail != nil, userInteracted {
-                    DiagnosticLogger.shared.log(
-                        "captureFocusedElement: discarded remembered context after user interaction")
-                } else if lastTail != nil, focusedElementMatches == false {
-                    DiagnosticLogger.shared.log(
-                        "captureFocusedElement: discarded remembered context after focus changed")
-                }
-            }
-
-            // Generation-guarded: a stale capture from a previous recording is dropped.
-            // When source=none, say WHY the live read produced nothing: an AX-opaque /
-            // Chromium-class app has its live read deliberately skipped (context can only
-            // come from the remembered insertion tail), which is a very different state from
-            // a native app whose AX read was attempted and came back empty. Without this
-            // distinction the "source=none len=0" line reads as "AX is failing" when the read
-            // never ran (2026-08-18 bug hunt was misdirected by exactly this ambiguity).
-            let noneReason = contextSource == "none"
-                ? (avoidLiveWindowContext
-                    ? " (liveAX skipped: AX-opaque/Chromium-class \(frontBundle ?? "?"))"
-                    : " (liveAX attempted, empty)")
-                : ""
-            DiagnosticLogger.shared.log("captureFocusedElement: context source=\(contextSource) len=\(capturedContext?.count ?? 0)\(noneReason)")
-            self?.focusCapture.publish((capturedElement, capturedContext), token: token)
+    /// Run `body` on the main actor, which owns the session: inline when already on main (every
+    /// hotkey, menu and local API path), queued otherwise (setup assigns the transcriber and
+    /// config off main, before listening starts).
+    private func onMainActor(_ body: @escaping @MainActor () -> Void) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated(body)
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated(body) }
         }
     }
 
-    /// Reads up to 500 characters before the cursor without changing selection or focus.
-    /// `requireCursorAtEnd`: trust gate for the AXManualAccessibility-unlocked
-    /// Electron read (2026-07-25: VS Code's reported cursor offset can be stale/
-    /// wrong, yielding context that "ends mid-sentence" and wrongly lowercasing a
-    /// fresh paragraph — the engine had capitalized "As usual" correctly). When
-    /// set, context is only returned if the cursor is verifiably at the END of
-    /// the field — the appending flow dictation actually uses.
-    /// AX roles that can actually hold a text cursor. Everything else is chrome.
-    ///
-    /// 2026-07-26 — walking VS Code's full AX tree (14 windows, 20k+ nodes) found the string
-    /// behind 45 of the day's bad reads: `⌘ Esc to focus or unfocus Claude`, exactly 32
-    /// characters, the Claude Code panel's hint label. It carries no terminal punctuation and no
-    /// trailing space, which is precisely the `prependSpace=true midSentence=true` signature the
-    /// log recorded 45 times. It is a LABEL. speakfree read it as "the text before your cursor"
-    /// and lowercased the first word of the dictation that followed.
-    ///
-    /// The size gates could never have caught this (a 32-char label is small), and the
-    /// repeat-value gate only half-catches it (reads alternate between two chrome strings, so
-    /// only 40 of 150 were identical to their predecessor). Asking what KIND of element it is
-    /// separates a label from an input in one attribute.
-    static let cursorBearingRoles: Set<String> = [
-        kAXTextAreaRole as String, kAXTextFieldRole as String,
-        kAXComboBoxRole as String, "AXSearchField",
-    ]
-
-    private func readTextBeforeCursor(in element: AXUIElement,
-                                      requireCursorAtEnd: Bool = false) -> String? {
-        // Role gate, before anything else: a label, button or static text never holds a cursor,
-        // so its text is never "what he typed before dictating".
-        var roleRef: CFTypeRef?
-        let role = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString,
-                                                 &roleRef) == .success
-            ? (roleRef as? String ?? "?") : "?"
-        guard Self.cursorBearingRoles.contains(role) else {
-            DiagnosticLogger.shared.log(
-                "readTextBeforeCursor: ignoring focused element of role \(role) — not a text input")
-            return nil
+    private func makeSession() {
+        onMainActor { [self] in
+            let session = DictationSession(recorder: recorder, inserter: inserter)
+            // The control center observes first, so an API caller hears about a finished or
+            // failed take before this app presents anything modal.
+            dictationControl.attach(to: session)
+            session.addObserver { [weak self] _, event in self?.present(event) }
+            session.transcriber = transcriber
+            if let config { session.configuration = DictationConfiguration(config: config) }
+            session.engineID = activeEngineID
+            self.session = session
+            updateSessionAvailability()
         }
+    }
 
-        var valueRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
-              let fullText = valueRef as? String, !fullText.isEmpty else { return nil }
-
-        // Try to get cursor position from selected text range
-        var rangeRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-           let rangeValue = rangeRef,
-           CFGetTypeID(rangeValue) == AXValueGetTypeID() {
-            var range = CFRange()
-            AXValueGetValue(rangeValue as! AXValue, .cfRange, &range)
-            // range.location is a UTF-16 offset — convert via the utf16 view (AX-E).
-            let cursorIndex = max(0, range.location)
-            if requireCursorAtEnd {
-                // Electron trust gates (2026-07-25): offset must be at field end, AND
-                // the field must be input-sized — VS Code hands us the TERMINAL
-                // SCROLLBACK document as the "focused element", whose tail never ends
-                // in whitespace (phantom leading spaces + wrongful lowercase). Real
-                // inputs (search boxes, chat prompts) are short; documents are not.
-                if cursorIndex < fullText.utf16.count { return nil }
-                // Input-shaped only: a VS Code TUI screen can be under 4000 chars,
-                // but no search box or chat prompt is 5+ lines of text ending in a
-                // shell prompt. (2026-07-25, third phantom-space report.)
-                if fullText.utf16.count > 1200 { return nil }
-                if fullText.filter({ $0.isNewline }).count > 4 { return nil }
-            }
-            if cursorIndex > 0, let before = TextInserter.textBeforeUTF16Offset(fullText, cursorIndex) {
-                // Take last 500 chars to stay within whisper's prompt limits
-                return String(before.suffix(500))
-            }
-        }
-
-        // No cursor info: DO NOT guess from the whole field's tail (2026-07-25:
-        // the AXManualAccessibility unlock opened Electron fields whose tail is
-        // arbitrary document text — it rarely ends in a space, so the prepend-space
-        // logic added phantom leading spaces to every dictation). nil lets the
-        // last-insertion fallback chain decide, which carries real cursor knowledge.
-        return nil
+    private func updateSessionAvailability() {
+        let enabled = isReady && !isTerminating
+        onMainActor { [weak self] in self?.session?.isEnabled = enabled }
     }
 
     func handleRecordingStart() {
-        guard !isPressed else { return }
-        if let timer = postBufferTimer {
-            // Capture is still running during the post-buffer. Continue this take without
-            // creating another WAV/sentinel or replacing the original insertion context.
-            postBufferGeneration &+= 1
-            timer.invalidate()
-            postBufferTimer = nil
-            isPressed = true
-            continuedReleasedTake = true
-            startRecordingWatchdog()
-            startStreamingTimer()
-            return
+        onMainActor { [weak self] in self?.session?.start(destination: .cursor) }
+    }
+
+    func handleRecordingStop() {
+        onMainActor { [weak self] in self?.session?.stopRecording() }
+    }
+
+    /// A real key was pressed while fn was held — this is a keyboard shortcut, not dictation.
+    /// Cancel the press silently and let the shortcut pass through (see `abortPress`).
+    func handleRecordingAbort() {
+        onMainActor { [weak self] in _ = self?.session?.abortPress() }
+    }
+
+    func resetRecordingUIAfterAbort() {
+        statusBar.state = .idle
+        recordingOverlay.hide()
+        statusBar.buildMenu()
+    }
+
+    /// Present one session event: menu-bar state, the recording overlay, alerts.
+    private func present(_ event: DictationEvent) {
+        switch event {
+        case .preparing:
+            // A stale Secure-Input retry must never fire mid-take or after a newer dictation —
+            // starting a new recording supersedes the parked text.
+            cancelSecureInputRetry()
+            // Verify all subsystems before every recording
+            verifySubsystems(context: "pre-recording")
+        case .starting:
+            statusBar.state = .recording
+            recordingOverlay.style = min(5, max(1, config.overlayStyle ?? 5))
+            recordingOverlay.show(state: .recording, recorder: recorder)
+        case .partialText(let text):
+            recordingOverlay.updateStreamingText(text)
+        case .partialTextCleared:
+            recordingOverlay.clearStreamingText()
+        case .audioStalled:
+            recordingOverlay.show(
+                state: .error("Mic went silent: audio is not being captured"),
+                autoHideError: false)
+        case .audioRecovered:
+            recordingOverlay.show(state: .recording, recorder: recorder)
+        case .captureEnded:
+            // L1: the take's capture is over. Applying a deferred FULL reload here — before the
+            // session snapshots the transcriber and configuration — means no finalize path leaves
+            // it stranded, and it is the un-defer point for toggle mode (where handleKeyUp
+            // returned early). The whole finalization then runs on ONE engine.
+            performPendingConfigReloadIfNeeded()
+        case .transcribing:
+            statusBar.state = .transcribing
+            recordingOverlay.update(state: .transcribing)
+        case .modelLoading:
+            recordingOverlay.updateStreamingText("Loading speech model…")
+        case .delivering:
+            recordingOverlay.hide()
+        case .deliveryFallback(let fallback):
+            presentDeliveryFallback(fallback)
+        case .finished(let result):
+            presentFinished(result)
+        case .failed(let failure):
+            presentFailure(failure)
+        case .cancelled:
+            resetRecordingUIAfterAbort()
+            // L1: the dictation ended (aborted) — apply any config reload deferred while fn was held.
+            performPendingConfigReloadIfNeeded()
+        case .recording, .resumed, .released, .retargeted, .inputLevel:
+            break
         }
-        continuedReleasedTake = false
-        let startRequestedAt = CFAbsoluteTimeGetCurrent()
+    }
 
-        // A stale Secure-Input retry must never fire mid-take or after a newer dictation —
-        // starting a new recording supersedes the parked text.
-        cancelSecureInputRetry()
-
-        // Microphone gate: never silently record silence. If access is missing, this prompts
-        // (notDetermined) or shows an actionable alert (denied) and aborts this attempt.
-        guard Permissions.ensureMicrophoneForRecording() else { return }
-
-        isPressed = true
-
-        // Verify all subsystems before every recording
-        verifySubsystems(context: "pre-recording")
-        let healthFinishedAt = CFAbsoluteTimeGetCurrent()
-
-        // Detect style mode from frontmost app before menu bar steals focus. The
-        // bundle id is also kept for the .meta.json sidecar — the edit-feedback batch
-        // (tune-corpus) correlates dictations with where the text landed.
-        let frontApp = NSWorkspace.shared.frontmostApplication
-        let frontBundleID = frontApp?.bundleIdentifier
-        let avoidLiveWindowContext = TextInserter.shouldAvoidLiveWindowContext(
-            bundleID: frontBundleID, bundleURL: frontApp?.bundleURL)
-        recordingTargetBundleID = frontBundleID
-        inserter.livePrependProbeSuppressed =
-            TextInserter.prefersClipboardPaste(app: frontApp)
-        recordingStyleMode = TextPostProcessor.detectStyleMode(bundleID: frontBundleID)
-        let classificationFinishedAt = CFAbsoluteTimeGetCurrent()
-
-        // Capture focused element before anything else changes.
-        // Skip for remote desktop — AX reads the Splashtop UI, not the remote text field.
-        if !inserter.isRemoteDesktopFrontmost() {
-            captureFocusedElement()
-        } else {
-            // Remote desktop: AX would read the Splashtop UI, not the remote field. Reset the
-            // capture box to a published-nil so finalize consumes no stale context.
-            focusCapture.reset()
+    private func presentFinished(_ result: DictationResult) {
+        switch result.delivery {
+        case .editSession:
+            // The edit session owns the segment; nothing was typed or shown.
+            statusBar.state = .idle
+        case .returnedToCaller:
+            if result.recordingKept {
+                statusBar.noteFinishedRecording(url: result.audioURL, text: result.styled)
+            }
+            statusBar.state = .idle
+        case .inserted, .copiedToClipboard:
+            if result.recordingKept {
+                statusBar.noteFinishedRecording(url: result.audioURL, text: result.styled)
+            }
+            lastTranscription = result.styled
+            UsageStats.shared.recordDictation(
+                characters: result.styled.count, audioSeconds: result.audioDuration)
+            if result.delivery == .inserted {
+                statusBar.state = .idle
+                statusBar.buildMenu()
+            }
+        case .nothingToInsert:
+            if result.recordingKept {
+                statusBar.noteFinishedRecording(url: result.audioURL, text: result.styled)
+            }
+            showTransientState(.noSpeech, for: 4)
         }
+    }
 
-        // Capture screen context in background if enabled.
-        // Skip for remote desktop apps — OCR captures the remote screen content
-        // which whisper then parrots instead of transcribing speech.
-        // Skip when the engine ignores prompts (Parakeet, the default engine): the OCR text
-        // only ever feeds the inference prompt, so capturing the full screen for it is
-        // wasted work AND a needless read of everything visible.
-        let isRemoteDesktop = inserter.isRemoteDesktopFrontmost()
-        // engineUsesPrompt no longer gates the capture (2026-07-25): OCR now also
-        // feeds the screen-aware NAME corrector, which works on every engine —
-        // Parakeet users get on-screen spellings (Kris vs Chris) even though the
-        // engine ignores prompts.
-        if config.screenContext?.value == true && !isRemoteDesktop && !avoidLiveWindowContext {
-            // Bump generation so any in-flight OCR from a previous recording is discarded.
-            let capturedGeneration = UUID()
-            screenCaptureGeneration = capturedGeneration
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let text = ScreenContext.captureAndRecognize()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self, self.screenCaptureGeneration == capturedGeneration else { return }
-                    self.screenContextText = text
+    private func presentDeliveryFallback(_ fallback: DictationDeliveryFallback) {
+        switch fallback {
+        case .mayHaveCommitted:
+            // The AX write MAY have landed — never prompt a paste or auto-retry
+            // here, both risk a duplicate. Checkmark only.
+            statusBar.state = .secureInputCopied
+            statusBar.buildMenu()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                self.statusBar.state = .idle
+                self.statusBar.buildMenu()
+            }
+        case .secureInput(let text):
+            // Definitely NOT inserted: show the retry dialog (Michael 2026-08-12)
+            // and auto-insert the moment Secure Input clears.
+            statusBar.state = .secureInputCopied
+            statusBar.buildMenu()
+            beginSecureInputRetry(text: text)
+        case .focusLost:
+            if statusBar.state != .secureInputCopied {
+                statusBar.state = .copiedToClipboard
+                statusBar.buildMenu()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self.statusBar.state = .idle
+                    self.statusBar.buildMenu()
                 }
             }
         }
+    }
 
-        statusBar.state = .recording
-        recordingOverlay.style = min(5, max(1, config.overlayStyle ?? 5))
-        recordingOverlay.show(state: .recording, recorder: recorder)
-        let overlayFinishedAt = CFAbsoluteTimeGetCurrent()
-        startRecordingWatchdog()
-        do {
-            // Always write to recordings dir — crash recovery works regardless of maxRecordings
-            let outputURL = RecordingStore.newRecordingURL()
-            recordingActivityLease = try RecordingActivity.shared.acquire(outputURL)
-            let pathPreparedAt = CFAbsoluteTimeGetCurrent()
-            RecordingStore.writeSentinel(recordingURL: outputURL)
-            let sentinelWrittenAt = CFAbsoluteTimeGetCurrent()
-            try recorder.startRecording(to: outputURL)
-            let recordingStartedAt = CFAbsoluteTimeGetCurrent()
-            if recordingStartedAt - startRequestedAt >= 0.25 {
-                DiagnosticLogger.shared.log(String(
-                    format: "Recording start slow: health=%.2fs classify=%.2fs overlay=%.2fs file=%.2fs total=%.2fs",
-                    healthFinishedAt - startRequestedAt,
-                    classificationFinishedAt - healthFinishedAt,
-                    overlayFinishedAt - classificationFinishedAt,
-                    recordingStartedAt - overlayFinishedAt,
-                    recordingStartedAt - startRequestedAt))
-                DiagnosticLogger.shared.log(String(
-                    format: "Recording file setup: path=%.3fs sentinel=%.3fs writer=%.3fs",
-                    pathPreparedAt - overlayFinishedAt,
-                    sentinelWrittenAt - pathPreparedAt,
-                    recordingStartedAt - sentinelWrittenAt))
-            }
-
-            // Start streaming transcription timer — processes audio every 2s for live preview
-            startStreamingTimer()
-            dictationControl.pipelineDidStartRecording(sessionID: pendingAPISession?.id)
-        } catch {
-            // MUST be visible in the diagnostic log: this branch used to print only to
-            // stdout, so the 2026-07-23 every-press-fails outage looked like a silent
-            // no-op ("Health check: all OK" then nothing) and took a live stdout
-            // capture to see. Error description only — never transcript content.
-            DiagnosticLogger.shared.log("Recording start FAILED: \(error)")
-            stopRecordingWatchdog()
-            print("Error: \(error.localizedDescription)")
-            if let lease = recordingActivityLease {
-                RecordingStore.clearSentinel(recordingURL: lease.audioURL)
-            }
-            recordingActivityLease = nil
-            isPressed = false
-            focusCapture.reset()  // recording never started — invalidate the in-flight capture
-            // I4: OCR was kicked off just above, but recording never started so nothing will
-            // consume it. Clear it and invalidate the in-flight capture so a late OCR write can't
-            // bias the next dictation's prompt.
-            screenContextText = nil
-            screenCaptureGeneration = UUID()
+    private func presentFailure(_ failure: DictationFailure) {
+        switch failure {
+        case .recordingFailed:
             statusBar.state = .idle
             // LOUD failure (2026-07-25): the overlay used to flash for one frame and
             // hide — the user pressed the key, spoke, and got nothing. Now a red
             // center-screen banner says so (auto-hides).
             recordingOverlay.show(state: .error("Recording failed: check your microphone"))
-            dictationControl.pipelineDidFail(sessionID: pendingAPISession?.id,
-                                             message: "Recording failed: check your microphone")
-            pendingAPISession = nil
+        case .captureFailed:
+            statusBar.state = .captureFailed
+            statusBar.buildMenu()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                if self.statusBar.state == .captureFailed {
+                    self.statusBar.state = .idle
+                    self.statusBar.buildMenu()
+                }
+            }
+            recordingOverlay.show(state: .error("Capture failed: please try again"))
+            showCaptureFailureAlert()
+            statusBar.state = .idle
+            recordingOverlay.hide()
+        case .silent:
+            // The user held the key and spoke into a dead mic — say so (F12:
+            // gate failures were a silent no-op; the empty-transcript fix
+            // didn't cover this path).
+            showTransientState(.noSpeech, for: 4)
+            recordingOverlay.show(state: .error("No speech captured: check your mic"))
+        case .noAudio, .tooShort, .engineNotReady:
+            statusBar.state = .idle
+            recordingOverlay.hide()
+        case .modelMissing:
+            recordingOverlay.hide()
+            let message = "Parakeet model not downloaded — open Settings to download."
+            print("Error: \(message)")
+            DiagnosticLogger.shared.log(message)
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Model Not Downloaded"
+            alert.informativeText = message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Open Settings")
+            alert.addButton(withTitle: "Later")
+            if alert.runModal() == .alertFirstButtonReturn {
+                showSettings()
+            }
+            statusBar.state = .idle
+            statusBar.buildMenu()
+        case .transcriptionFailed(let reason, let recordingKept):
+            recordingOverlay.hide()
+            // Throttle the modal: a persistently broken engine fails EVERY
+            // dictation, and one focus-stealing alert per attempt is hostile.
+            // The session logs every failure regardless.
+            let now = Date()
+            if lastTranscriptionFailureAlert.map({ now.timeIntervalSince($0) > 300 }) ?? true {
+                lastTranscriptionFailureAlert = now
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.messageText = "Transcription Failed"
+                let recordingNote = recordingKept
+                    ? "Your recording was kept and can be transcribed from the recordings folder."
+                    : "The recording was discarded (saving recordings is off)."
+                alert.informativeText = "The engine reported an error. \(recordingNote)"
+                    + "\n\n\(reason)"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+            statusBar.state = .idle
+            statusBar.buildMenu()
+        case .notReady, .busy, .microphoneUnavailable, .notRecording, .cancelled:
+            break
+        }
+    }
+
+    /// Show `state` in the menu bar, returning to idle after `seconds` unless something else
+    /// changed it meanwhile.
+    private func showTransientState(_ state: StatusBarController.State, for seconds: TimeInterval) {
+        statusBar.state = state
+        statusBar.buildMenu()
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            if self.statusBar.state == state {
+                self.statusBar.state = .idle
+                self.statusBar.buildMenu()
+            }
         }
     }
 
@@ -1774,679 +1524,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// A real key was pressed while fn was held — this is a keyboard shortcut, not dictation.
-    /// Cancel the press silently and let the shortcut pass through. If this press resumed an
-    /// already-released take, preserve that take and return to its normal post-buffer/finalize.
-    func handleRecordingAbort() {
-        guard isPressed else { return }
-        if continuedReleasedTake {
-            handleRecordingStop()
-            return
-        }
-        isPressed = false
-
-        stopRecordingWatchdog()
-        stopStreamingTimer()
-
-        if let result = recorder.stopRecording() {
-            try? FileManager.default.removeItem(at: result.url)
-            RecordingStore.clearSentinel(recordingURL: result.url)
-        }
-        if let lease = recordingActivityLease {
-            RecordingStore.clearSentinel(recordingURL: lease.audioURL)
-        }
-        recordingActivityLease = nil
-        focusCapture.reset()  // invalidate any in-flight focus capture
-        screenContextText = nil
-        screenCaptureGeneration = UUID()  // invalidate any in-flight OCR
-        resetRecordingUIAfterAbort()
-        dictationControl.pipelineDidCancel(sessionID: pendingAPISession?.id)
-        pendingAPISession = nil
-
-        // L1: the dictation ended (aborted) — apply any config reload deferred while fn was held.
-        performPendingConfigReloadIfNeeded()
-    }
-
-    func resetRecordingUIAfterAbort() {
-        statusBar.state = .idle
-        recordingOverlay.hide()
-        statusBar.buildMenu()
-    }
-
-    /// In-recording dead-audio watchdog (2026-07-25 audit C3/C5): the ONLY health
-    /// checks used to run before recording started — a 60-minute hold had none. Every
-    /// 5s this compares the last-buffer timestamp; >3s of no audio mid-recording means
-    /// the tap/route died (AirPods handoff, config change) and the user must know NOW,
-    /// not after dictating 40 minutes into a dead mic. The overlay flips to a red
-    /// banner while audio is dead and back to the recording pill if it recovers.
-    private func startRecordingWatchdog() {
-        recordingWatchdogTimer?.invalidate()
-        watchdogWarnedDeadAudio = false
-        recordingWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.isPressed else { return }
-            let deadFor = self.recorder.secondsSinceLastBuffer()
-            let peak = self.recorder.peakSinceLastCheck()
-            // Two dead shapes (codex review #4): NO buffers (tap/route died), and
-            // buffers of pure digital silence (muted mic / stale route still
-            // delivering zeros — the 2026-07-25 lost VS Code dictation). A live mic's
-            // noise floor peaks well above 0.001; zeros don't. Two consecutive silent
-            // ticks (10s) before warning so a quiet pause can't false-positive.
-            let buffersDead = deadFor > 3.0
-            if buffersDead {
-                self.watchdogSilentTicks = 0
-            } else if peak < 0.001 {
-                self.watchdogSilentTicks += 1
-            } else {
-                self.watchdogSilentTicks = 0
-            }
-            let silentMic = self.watchdogSilentTicks >= 2
-            if buffersDead || silentMic {
-                if !self.watchdogWarnedDeadAudio {
-                    self.watchdogWarnedDeadAudio = true
-                    DiagnosticLogger.shared.log(String(
-                        format: "WATCHDOG: %@ mid-recording (no-buffers %.1fs, peak %.4f)",
-                        buffersDead ? "capture dead" : "mic delivering silence", deadFor, peak))
-                    self.recordingOverlay.show(
-                        state: .error("Mic went silent: audio is not being captured"),
-                        autoHideError: false)
-                    if buffersDead {
-                        self.recorder.recoverDeadCaptureDuringRecording()
-                    }
-                }
-            } else if self.watchdogWarnedDeadAudio {
-                self.watchdogWarnedDeadAudio = false
-                DiagnosticLogger.shared.log("WATCHDOG: audio resumed")
-                self.recordingOverlay.show(state: .recording, recorder: self.recorder)
-            }
-        }
-    }
-
-    private func stopRecordingWatchdog() {
-        recordingWatchdogTimer?.invalidate()
-        recordingWatchdogTimer = nil
-        watchdogWarnedDeadAudio = false
-        watchdogSilentTicks = 0
-    }
-
-    func handleRecordingStop() {
-        guard isPressed else { return }
-        isPressed = false
-        continuedReleasedTake = false
-
-        stopRecordingWatchdog()
-
-        // Stop streaming timer and clear streaming state
-        stopStreamingTimer()
-
-        // Capture key-release time NOW — finalizeRecording runs up to 300ms later, so
-        // measuring inside it would undercount the post-buffer delay in the latency log.
-        let keyReleaseTime = CFAbsoluteTimeGetCurrent()
-
-        // T2.1 — Adaptive post-buffer. We still keep recording AFTER key release so the tail of
-        // the last word (an AVAudioEngine buffer releasing mid-word loses its tail) isn't clipped.
-        // But instead of a FLAT 300ms tax on every dictation, we poll the trailing audio's RMS and
-        // finalize as soon as ~150ms of trailing silence is observed — hard-capped at 300ms so we
-        // are NEVER worse than the old flat wait. The wait DECISION is the pure PostBufferPolicy
-        // (unit-tested over RMS windows); this loop only feeds it the live trailing samples.
-        let samplesAtRelease = recorder.currentSampleCount()
-        runAdaptivePostBuffer(samplesAtRelease: samplesAtRelease) { [weak self] in
-            self?.finalizeRecording(keyReleaseTime: keyReleaseTime)
-        }
-    }
-
-    /// Poll the recorder's trailing audio on a short timer; once `PostBufferPolicy.decideWaitMs`
-    /// says enough contiguous trailing silence has accrued (or the 300ms cap is hit), invoke
-    /// `finalize` on the main queue. `samplesAtRelease` marks the sample count at key-release so
-    /// only audio captured AFTER the key lifted is scored as "trailing". The decision is the pure
-    /// policy; this only feeds it the live trailing samples.
-    private func runAdaptivePostBuffer(samplesAtRelease: Int, finalize: @escaping () -> Void) {
-        let windowMs = postBufferWindowMs
-        // Hard deadline = the EXTENDED cap (2026-07-25): the policy's decided wait stays ≤220ms
-        // for quiet releases and only exceeds it when trailing speech energy shows the speaker
-        // finishing a word across the release — the deadline must not amputate that extension
-        // (a word spoken across release died at the old 220ms ceiling: "…the last word, ⟨release⟩
-        // selectors" → transcript ended at "word."). Latency for quiet releases is unchanged;
-        // the deadline is the runaway guard only.
-        let capMs = PostBufferPolicy.defaultExtendedCapMs
-        // Perf adjudication dispute #1: bound the total wait by a MONOTONIC deadline. DispatchTime
-        // is a monotonic clock (unlike wall-clock CFAbsoluteTimeGetCurrent, which NTP/clock-set can
-        // jump), so a congested runloop firing a late tick still stops at the first tick past the
-        // cap — we check the CURRENT clock against the deadline each tick, never trust tick count.
-        let startTick = DispatchTime.now().uptimeNanoseconds
-
-        postBufferTimer?.invalidate()
-        postBufferGeneration &+= 1
-        let generation = postBufferGeneration
-        postBufferTimer = Timer.scheduledTimer(withTimeInterval: windowMs / 1000.0, repeats: true) { [weak self] timer in
-            guard let self = self else { timer.invalidate(); return }
-            guard self.postBufferGeneration == generation, !self.isPressed else {
-                timer.invalidate()
-                return
-            }
-            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- startTick) / 1_000_000.0
-            // R3: copy only the trailing slice, not the full (growing) sample array each tick.
-            let trailing = self.recorder.samples(after: samplesAtRelease)
-            // Ask the pure policy how long it wants given the trailing audio seen so far.
-            let decided = PostBufferPolicy.decideWaitMs(trailingSamples: trailing, windowMs: windowMs)
-
-            // Stop once the decided wait has elapsed, or the monotonic cap deadline is reached.
-            if PostBufferPolicy.postBufferShouldFinalize(elapsedMs: elapsedMs, decidedMs: decided, capMs: capMs) {
-                timer.invalidate()
-                self.postBufferTimer = nil
-                finalize()
-            }
-        }
-    }
-
-    func finalizeRecording(keyReleaseTime: Double = CFAbsoluteTimeGetCurrent()) {
-        let activityLease = recordingActivityLease
-        recordingActivityLease = nil
-        // Retain on every synchronous early-return path, then transfer into Task below.
-        defer { withExtendedLifetime(activityLease) {} }
-        // L1: the key was released before the post-buffer scheduled this call (isPressed is
-        // already false). Applying a deferred FULL reload here — ahead of every return below —
-        // guarantees no exit path (toggle-mode stop, gate failure, nil transcriber, success) leaves
-        // it stranded, and it is the un-defer point for toggle mode (where handleKeyUp returned
-        // early). Running before the transcriber snapshot below means the swap is atomic w.r.t.
-        // this finalize: the snapshot picks up the freshly-applied engine and the whole
-        // finalization runs on ONE engine (no torn mid-async swap). Idempotent with the handleKeyUp
-        // / abort calls via the flag guard.
-        performPendingConfigReloadIfNeeded()
-
-        let stopTime = keyReleaseTime
-        // Local-API session for this take (nil for hotkey dictations), captured before any exit.
-        let apiSession = pendingAPISession
-        pendingAPISession = nil
-        let apiSessionID = apiSession?.id
-        let callerSession = apiSession?.destination == .caller ? apiSession?.id : nil
-
-        guard let recording = recorder.stopRecording() else {
-            if let activityLease {
-                RecordingStore.clearSentinel(recordingURL: activityLease.audioURL)
-            }
-            focusCapture.reset()
-            statusBar.state = .idle
-            recordingOverlay.hide()
-            dictationControl.pipelineDidFail(sessionID: apiSessionID, message: "No audio was captured")
-            return
-        }
-        let audioURL = recording.url
-
-        // Pre-transcription gates (too-short / silent), with the wav on disk as arbiter:
-        // if the in-memory samples fail a gate but the just-written wav passes, transcribe
-        // the wav's samples instead of dropping the dictation (2026-06-29: a good AirPods
-        // recording was dropped as "silent"; the wav transcribed fine offline).
-        // Threshold + RMS live in FinalizePipeline so the test harness gates on the SAME values.
-        let gate = FinalizePipeline.resolveGateSamples(
-            memorySamples: recording.samples,
-            readWav: { try? ProcessCommand.loadSamples(from: audioURL) }
-        )
-        if let failure = gate.failure {
-            if case .captureFailed = failure {
-                DiagnosticLogger.shared.log(
-                    "Finalize: zero-payload take; capture failed with zero PCM frames")
-            }
-            // A 0-sample or silent primary means a dead engine, not an accidental tap —
-            // kick a rebuild now regardless of how the dictation resolves.
-            switch failure {
-            case .captureFailed:
-                recorder.recoverFailedCapture()
-            case .silent:
-                recorder.recoverFailedCapture()
-            default:
-                break
-            }
-            switch failure {
-            case .tooShort(let count):
-                // Likely an accidental tap — skip quietly.
-                DiagnosticLogger.shared.log(
-                    "Recording too short (\(count) samples / \(Int(Double(count) / 16000.0 * 1000))ms) — skipping")
-            default:
-                // NOTE: the wav either agreed or could not be read — resolveGateSamples does
-                // not distinguish; do not claim agreement in the log.
-                DiagnosticLogger.shared.log(
-                    "Recording was silent (RMS \(FinalizePipeline.rms(of: recording.samples))) and the wav did not rescue it — audio engine may be dead, rebuilding")
-            }
-            // Keep None also applies to diagnostic failures. Developer mode remains
-            // the explicit, visibly disclosed override through effectiveSaveRecordings.
-            let isSilentFailure: Bool
-            if case .silent = failure { isSilentFailure = true } else { isSilentFailure = false }
-            let isCaptureFailure: Bool
-            if case .captureFailed = failure {
-                isCaptureFailure = true
-                try? FileManager.default.removeItem(at: audioURL)
-            } else {
-                isCaptureFailure = false
-            }
-            if !DevMode.effectiveSaveRecordings(config) {
-                try? FileManager.default.removeItem(at: audioURL)
-            }
-            if isCaptureFailure {
-                statusBar.state = .captureFailed
-                statusBar.buildMenu()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                    if self.statusBar.state == .captureFailed {
-                        self.statusBar.state = .idle
-                        self.statusBar.buildMenu()
-                    }
-                }
-                recordingOverlay.show(state: .error("Capture failed: please try again"))
-                showCaptureFailureAlert()
-            } else if isSilentFailure && DevMode.effectiveSaveRecordings(config) {
-                // Empty sidecar (review #6): the kept wav is diagnostic evidence,
-                // NOT a recoverable dictation — without this the launch sweep
-                // re-offers known-silent audio every launch and masks real orphans.
-                RecordingStore.saveTranscription(text: "", for: audioURL)
-            }
-            RecordingStore.clearSentinel(recordingURL: audioURL)
-            focusCapture.reset()
-            // I4: a gate-failed dictation never consumes its OCR, so clear it and invalidate any
-            // in-flight capture — otherwise this recording's screenContextText survives and biases
-            // the NEXT dictation's prompt with stale on-screen text.
-            screenContextText = nil
-            screenCaptureGeneration = UUID()
-            if isSilentFailure {
-                // The user held the key and spoke into a dead mic — say so (F12:
-                // gate failures were a silent no-op; the empty-transcript fix
-                // didn't cover this path).
-                statusBar.state = .noSpeech
-                statusBar.buildMenu()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                    if self.statusBar.state == .noSpeech {
-                        self.statusBar.state = .idle
-                        self.statusBar.buildMenu()
-                    }
-                }
-                recordingOverlay.show(state: .error("No speech captured: check your mic"))
-            } else {
-                statusBar.state = .idle
-                recordingOverlay.hide()
-            }
-            let gateMessage: String
-            switch failure {
-            case .tooShort: gateMessage = "Recording too short"
-            case .silent: gateMessage = "No speech captured"
-            case .captureFailed: gateMessage = "Capture failed"
-            default: gateMessage = "Recording rejected"
-            }
-            dictationControl.pipelineDidFail(sessionID: apiSessionID, message: gateMessage)
-            return
-        }
-        if gate.usedWavFallback {
-            // Divergence between the tap's in-memory copy and the wav is an upstream bug —
-            // the dictation is saved, but leave a trace so it can be chased.
-            DiagnosticLogger.shared.log(
-                "Gate override: in-memory samples failed (count \(recording.samples.count), RMS \(FinalizePipeline.rms(of: recording.samples))) but wav passed — transcribing wav samples")
-        }
-        let samples = gate.samples
-
-        statusBar.state = .transcribing
-        recordingOverlay.update(state: .transcribing)
-        dictationControl.pipelineDidBeginTranscribing(sessionID: apiSessionID)
-
-        // R1: consume the off-main focus capture. In the normal case it published while the
-        // user was still speaking, so this returns immediately; only if the AX read is still
-        // in flight does it wait briefly (0.5s budget, the same as the old synchronous
-        // capture — but off the felt start path). nil on timeout is identical to the old
-        // AX-timeout behavior.
-        let (capturedElement, capturedInputText) = focusCapture.consume(waitingUpTo: 0.5) ?? (nil, nil)
-        let capturedScreenText = screenContextText
-        screenContextText = nil
-        screenCaptureGeneration = UUID()  // invalidate any late-arriving OCR
-
-        // T2.2 — Precompute shouldPrependSpace NOW, on main, from the cursor-context string
-        // that was already captured at record-start (off main, inside captureFocusedElement).
-        // The last character of capturedInputText IS the character immediately before the cursor,
-        // so no further AX query is needed. This eliminates the 300ms semaphore.wait that
-        // previously blocked the main thread at insert time.
-        //
-        // Tradeoff: the value reflects the focused element at RECORD-START. If focus changes
-        // mid-dictation the answer may be stale — but we refocus that same element anyway, so
-        // the element and the precomputed context always agree.
-        let capturedPrependSpace = TextInserter.shouldPrependSpace(contextBefore: capturedInputText)
-        DiagnosticLogger.shared.log(
-            "Finalize: prependSpace=\(capturedPrependSpace) midSentence=\(TextPipeline.isMidSentence(contextBefore: capturedInputText)) ctxLen=\(capturedInputText?.count ?? 0)")
-
-        // Snapshot ALL config-derived state on main before crossing into the async Task.
-        // Accessing self.config.* from a background queue is a torn-read race — Config is a
-        // struct so reads and writes are not atomic across threads.
-        // Retention is deliberately NOT captured here. A user can change it while
-        // inference runs; the completion must honor that newer preference.
-        // Resolved through the one shared default (Michael 2026-08-12). The full history of
-        // why a missing key means `.off` — including the reverted 2026-07-26 flip to
-        // `.hybrid` and the text corruption it caused — lives on
-        // `Config.effectivePunctuationMode`, which every consumer (here, Settings, Help,
-        // ProcessCommand) now reads. Do not reintroduce a site-local `??` default.
-        let mode = config.effectivePunctuationMode
-        let glossary = Config.loadVocabulary()
-        let overrides = Config.loadOverrides()
-        let capturedStyleMode = recordingStyleMode
-        // Provenance snapshot for the .meta.json sidecar — engine/model from the ACTIVE
-        // transcriber (not config, which can disagree after a model fallback).
-        let metaEngine = activeEngineID
-        let metaDevice = recorder.currentCaptureDeviceName()
-        let metaTargetApp = recordingTargetBundleID
-        // C1: snapshot the edit-session target (nil for hold/toggle) on main before the async Task,
-        // so the finalize destination is decided from the target captured at record-start, never
-        // re-derived. Always nil in Phase 1 (no EditSessionController yet) → insertImmediately.
-        let editTarget = pendingEditFinalizeTarget
-
-        // Snapshot the transcriber on main BEFORE crossing into the async Task. A settings
-        // change mid-finalize (reloadConfig) can swap self.transcriber out from under us; the
-        // snapshot guarantees this recording's audio runs through the engine that was active
-        // when the user spoke, not a freshly-swapped one.
-        guard let transcriber = self.transcriber else {
-            RecordingStore.clearSentinel(recordingURL: audioURL)
-            statusBar.state = .idle
-            recordingOverlay.hide()
-            dictationControl.pipelineDidFail(sessionID: apiSessionID, message: "Transcription engine not ready")
-            return
-        }
-
-        // T2.3 — decide (on main, all state read here) whether to reuse the last streaming partial
-        // instead of running a fresh final inference. The gate (flag + freshness + growth) is the
-        // pure StreamingReuse type.
-        //
-        // DEFAULT OFF (AR-2 finding #2): the T2.3-PRE measurement that originally authorized
-        // default-ON only varied THREAD COUNT on 2–3 s hallucination slices ("(upbeat music)",
-        // empty strings) and reported 0.000% divergence — agreement on noise, not signal. It never
-        // measured the axis production actually swaps: a `prompt:nil`, NON-VAD-trimmed streaming
-        // partial (transcribeStreaming, AppDelegate path) replacing a glossary/screen/cursor-context
-        // -primed, VAD-trimmed FINAL pass (transcribe, prompt: prompt below). Re-measured on the FULL
-        // real-speech fixtures that axis diverges ~5% (>5× the locked <1% gate). So reuse is OFF by
-        // default until a valid prompt-axis measurement clears the gate; the flag remains for
-        // opt-in/experiments. When the gate declines, `reuseDecision` is `.runFinalInference` and the
-        // path below is byte-identical to pre-T2.3.
-        let reuseDecision = StreamingReuse.decide(StreamingReuse.State(
-            flagEnabled: config.reuseStreamingPartial?.value ?? false,
-            lastRawPartial: lastStreamingRawPartial,
-            lastStreamedSampleCount: lastStreamingSampleCount,
-            lastStreamCompletedAt: lastStreamingCompletedAt,
-            sampleCountAtRelease: samples.count,
-            keyReleaseAt: keyReleaseTime
-        ))
-
-        // Bridge into async: the transcribe pipeline is now async/await (FluidAudio is
-        // async-only; WhisperEngine exposes async shims). The engines serialize access to
-        // their own context internally, so we no longer need whisperSerialQueue to gate the
-        // final pass. Results are still marshalled back to main via DispatchQueue.main.async.
-        Task { [weak self, activityLease] in
-            defer { activityLease?.release() }
-            guard let self = self else { return }
-            do {
-                // Build Whisper prompt + run post-processing through the shared
-                // TextPipeline core. Extracting this out of an inline closure is
-                // what lets unit tests cover the same code path the app uses,
-                // preventing the kind of drift that shipped the v1.2.11 comma loop.
-
-                let pipelineContext = TextPipeline.Input(
-                    punctuationMode: mode,
-                    cursorContextText: capturedInputText,
-                    screenContextText: capturedScreenText,
-                    styleMode: capturedStyleMode,
-                    glossaryWords: glossary
-                )
-                let prompt = TextPipeline.assemblePromptHints(input: pipelineContext)
-                let makeInput: (String, Int) -> TextPipeline.Input = { raw, sampleCount in
-                    TextPipeline.Input(
-                        raw: raw,
-                        punctuationMode: mode,
-                        cursorContextText: capturedInputText,
-                        screenContextText: capturedScreenText,
-                        styleMode: capturedStyleMode,
-                        glossaryWords: glossary,
-                        overrides: overrides,
-                        audioDurationSeconds: Double(sampleCount) / 16000.0
-                    )
-                }
-
-                if !transcriber.isLoaded {
-                    DiagnosticLogger.shared.log(
-                        "Finalize: dictation waiting on model load (cold start)")
-                    DispatchQueue.main.async {
-                        self.recordingOverlay.updateStreamingText("Loading speech model…")
-                    }
-                }
-
-                let (primaryRaw, reusedPartial) = try await FinalizePipeline.resolveRaw(
-                    reuseDecision: reuseDecision
-                ) {
-                    try await transcriber.transcribe(
-                        audioURL: audioURL, samples: samples, prompt: prompt,
-                        punctuationMode: mode)
-                }
-                if reusedPartial {
-                    DiagnosticLogger.shared.log(
-                        "T2.3: reused last streaming partial (skipped final inference)")
-                }
-                let pipelineResult = TextPipeline.run(
-                    makeInput(primaryRaw, samples.count),
-                    precomputedPrompt: .some(prompt))
-                let text = pipelineResult.finalText
-                let meta = RecordingStore.RecordingMeta(
-                    appVersion: SpeakFree.version,
-                    engine: metaEngine,
-                    model: transcriber.modelID,
-                    inputDevice: metaDevice,
-                    date: ISO8601DateFormatter().string(from: Date()),
-                    durationSeconds: Double(samples.count) / 16_000.0,
-                    transcriptChars: text.count,
-                    targetApp: metaTargetApp,
-                    transcriptionDiagnostics: transcriber.lastDiagnostics
-                )
-                let retentionConfig = Config.load()
-                let keepRecording = DevMode.effectiveSaveRecordings(retentionConfig)
-                let maxRecordings = (DevMode.isActive || !keepRecording || retentionConfig.preserveAllRecordings?.value == true)
-                    ? 0 : Config.effectiveMaxRecordings(retentionConfig.maxRecordings)
-                RecordingStore.finishRecording(
-                    audioURL: audioURL, keep: keepRecording, raw: primaryRaw, text: text, meta: meta)
-                RecordingStore.clearSentinel(recordingURL: audioURL)
-                if keepRecording && maxRecordings > 0 {
-                    RecordingStore.prune(maxCount: maxRecordings)
-                }
-                // C1 finalize destination: hold/toggle insert immediately (today's path, unchanged);
-                // an edit segment is delivered to its session and CANNOT reach the inserter.
-                switch FinalizeDestination.resolve(editTarget: editTarget, callerSession: callerSession) {
-                case .returnToEditSession(let sessionID, let segmentID):
-                    let payload = EditFinalizePayload(
-                        sessionID: sessionID, segmentID: segmentID, raw: primaryRaw,
-                        pipelineText: text, audioURL: audioURL, meta: meta)
-                    DispatchQueue.main.async {
-                        // No presentFinalizedText, no TextInserter, no focus recapture — the session
-                        // owns the segment from here.
-                        self.statusBar.state = .idle
-                        self.editFinalizeSink?(payload)
-                        self.dictationControl.pipelineDidFinish(sessionID: nil, result: nil)
-                    }
-                case .returnToCaller(let sessionID):
-                    let payload = CallerFinalizePayload(
-                        sessionID: sessionID, raw: primaryRaw,
-                        processed: pipelineResult.processedText, styled: text)
-                    DispatchQueue.main.async {
-                        // No presentFinalizedText, no TextInserter: the text goes back over the
-                        // local API and never reaches the focused app.
-                        if keepRecording {
-                            self.statusBar.noteFinishedRecording(url: audioURL, text: text)
-                        }
-                        self.statusBar.state = .idle
-                        self.recordingOverlay.hide()
-                        self.dictationControl.pipelineDidFinish(sessionID: sessionID, result: payload)
-                    }
-                case .insertImmediately:
-                    DispatchQueue.main.async {
-                        if keepRecording {
-                            self.statusBar.noteFinishedRecording(url: audioURL, text: text)
-                        }
-                        self.presentFinalizedText(
-                            text,
-                            sampleCount: samples.count,
-                            stopTime: stopTime,
-                            prependSpace: capturedPrependSpace,
-                            contextBefore: capturedInputText,
-                            element: capturedElement
-                        )
-                        self.dictationControl.pipelineDidFinish(sessionID: apiSessionID, result: nil)
-                    }
-                }
-            } catch {
-                RecordingStore.clearSentinel(recordingURL: audioURL)
-                // The opt-out must win on the failure path too: finishRecording(keep:false)
-                // — the deletion the user consented to — is never reached when inference
-                // throws, and the wav would silently persist against the setting.
-                let retentionConfig = Config.load()
-                let keepRecording = DevMode.effectiveSaveRecordings(retentionConfig)
-                let maxRecordings = (DevMode.isActive || !keepRecording || retentionConfig.preserveAllRecordings?.value == true)
-                    ? 0 : Config.effectiveMaxRecordings(retentionConfig.maxRecordings)
-                if !keepRecording {
-                    try? FileManager.default.removeItem(at: audioURL)
-                }
-                if maxRecordings > 0 {
-                    RecordingStore.prune(maxCount: maxRecordings)
-                }
-                // Detect a missing engine model (e.g. Parakeet never downloaded) and surface a
-                // clear, actionable message instead of a generic failure. Either way the status
-                // must not stay stuck on .transcribing.
-                let isModelMissing: Bool
-                if case TranscriptionEngineError.modelAssetsMissing = error {
-                    isModelMissing = true
-                } else {
-                    isModelMissing = false
-                }
-                DispatchQueue.main.async {
-                    self.recordingOverlay.hide()
-                    // Report before any modal below: an API caller must not wait on an alert.
-                    self.dictationControl.pipelineDidFail(
-                        sessionID: apiSessionID,
-                        message: isModelMissing ? "Model not downloaded" : "Transcription failed")
-                    if isModelMissing {
-                        let message = "Parakeet model not downloaded — open Settings to download."
-                        print("Error: \(message)")
-                        DiagnosticLogger.shared.log(message)
-                        NSApp.activate(ignoringOtherApps: true)
-                        let alert = NSAlert()
-                        alert.messageText = "Model Not Downloaded"
-                        alert.informativeText = message
-                        alert.alertStyle = .warning
-                        alert.addButton(withTitle: "Open Settings")
-                        alert.addButton(withTitle: "Later")
-                        if alert.runModal() == .alertFirstButtonReturn {
-                            self.showSettings()
-                        }
-                    } else {
-                        // Must be VISIBLE: a swallowed throw here means a good recording
-                        // silently produces nothing (the 2026-06-29 dropped-dictation event
-                        // took 12 days to trace because this branch only printed to stdout).
-                        // Error type/description only — never transcript content.
-                        let message = "Transcription failed: \(error)"
-                        print("Error: \(message)")
-                        DiagnosticLogger.shared.log(message)
-                        // Throttle the modal: a persistently broken engine fails EVERY
-                        // dictation, and one focus-stealing alert per attempt is hostile.
-                        // The log line above fires every time regardless.
-                        let now = Date()
-                        if self.lastTranscriptionFailureAlert.map({ now.timeIntervalSince($0) > 300 }) ?? true {
-                            self.lastTranscriptionFailureAlert = now
-                            NSApp.activate(ignoringOtherApps: true)
-                            let alert = NSAlert()
-                            alert.messageText = "Transcription Failed"
-                            let recordingNote = keepRecording
-                                ? "Your recording was kept and can be transcribed from the recordings folder."
-                                : "The recording was discarded (saving recordings is off)."
-                            alert.informativeText = "The engine reported an error. \(recordingNote)"
-                                + "\n\n\(error.localizedDescription)"
-                            alert.alertStyle = .warning
-                            alert.addButton(withTitle: "OK")
-                            alert.runModal()
-                        }
-                    }
-                    self.statusBar.state = .idle
-                    self.statusBar.buildMenu()
-                }
-            }
-        }
-    }
-
-    private func presentFinalizedText(
-        _ text: String,
-        sampleCount: Int,
-        stopTime: Double,
-        prependSpace: Bool,
-        contextBefore: String?,
-        element: AXUIElement?
-    ) {
-        recordingOverlay.hide()
-        if !text.isEmpty {
-            let insertText = FinalizePipeline.composeInsertText(
-                text, prependSpace: prependSpace)
-            let spacing = TextInserter.spacingDiagnosis(
-                contextBefore: contextBefore, insertText: insertText)
-            DiagnosticLogger.shared.log(
-                "Insertion boundary: prev=\(TextInserter.charClass(contextBefore?.last)) "
-                    + "first=\(TextInserter.charClass(insertText.first)) → \(spacing.rawValue)")
-            lastTranscription = text
-            let audioSeconds = Double(sampleCount) / 16_000.0
-            UsageStats.shared.recordDictation(
-                characters: text.count, audioSeconds: audioSeconds)
-            inserter.onSecureInputFallback = { text, reason in
-                self.statusBar.state = .secureInputCopied
-                self.statusBar.buildMenu()
-                switch reason {
-                case .axTimeoutMayHaveCommitted:
-                    // The AX write MAY have landed — never prompt a paste or auto-retry
-                    // here, both risk a duplicate. Checkmark only, as before.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        self.statusBar.state = .idle
-                        self.statusBar.buildMenu()
-                    }
-                case .secureInput:
-                    // Definitely NOT inserted: show the retry dialog (Michael 2026-08-12)
-                    // and auto-insert the moment Secure Input clears.
-                    self.beginSecureInputRetry(text: text)
-                }
-            }
-            let pasted = inserter.insert(
-                text: insertText,
-                refocusing: element,
-                onFocusLost: {
-                    if self.statusBar.state != .secureInputCopied {
-                        self.statusBar.state = .copiedToClipboard
-                        self.statusBar.buildMenu()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                            self.statusBar.state = .idle
-                            self.statusBar.buildMenu()
-                        }
-                    }
-                })
-            if pasted {
-                lastInsertionTail = String(((contextBefore ?? "") + insertText).suffix(500))
-                lastInsertionBundleID =
-                    NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-                lastInsertionAt = Date()
-                lastInsertionElement = element
-                lastInsertionInteractionGeneration = currentUserInteractionGeneration()
-                let elapsed = CFAbsoluteTimeGetCurrent() - stopTime
-                DiagnosticLogger.shared.log(
-                    "Transcription complete: \(String(format: "%.2f", elapsed))s "
-                        + "from key-release to text-inserted, \(text.count) chars")
-                statusBar.state = .idle
-                statusBar.buildMenu()
-            }
-        } else {
-            let audioSeconds = Double(sampleCount) / 16_000.0
-            DiagnosticLogger.shared.log(String(
-                format: "Transcription EMPTY, nothing inserted (%.1fs of audio)",
-                audioSeconds))
-            statusBar.state = .noSpeech
-            statusBar.buildMenu()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                if self.statusBar.state == .noSpeech {
-                    self.statusBar.state = .idle
-                    self.statusBar.buildMenu()
-                }
-            }
-        }
-    }
-
     private func showCaptureFailureAlert() {
         let now = Date()
         guard lastTranscriptionFailureAlert.map({ now.timeIntervalSince($0) > 300 }) ?? true else {
@@ -2463,126 +1540,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    // MARK: - Streaming Transcription
-
-    private func startStreamingTimer() {
-        guard config.streamingEnabled?.value ?? true else { return }
-        // Gate on the transcriber's engine-agnostic passthroughs. Engines that don't support
-        // live preview (parakeet v1) report supportsStreaming == false and are skipped here.
-        guard transcriber.supportsStreaming, transcriber.isLoaded else { return }
-        streamingAssembler.reset()
-        isStreamingInFlight = false
-        resetStreamingReuseState()  // T2.3: no partial to reuse until the first pass completes
-        streamingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.processStreamingChunk()
-        }
-        DiagnosticLogger.shared.log("Streaming: timer started (2.0s interval)")
-    }
-
-    private func stopStreamingTimer() {
-        streamingTimer?.invalidate()
-        streamingTimer = nil
-        streamingAssembler.reset()
-        isStreamingInFlight = false
-        streamingGeneration &+= 1  // invalidate any in-flight partial-result callbacks
-        // NOTE: lastStreamingRawPartial/SampleCount/CompletedAt are intentionally NOT cleared here.
-        // handleRecordingStop() calls stopStreamingTimer() BEFORE finalizeRecording reads the reuse
-        // state, so clearing here would always defeat the reuse path. They are reset in
-        // startStreamingTimer() (next recording) instead.
-        recordingOverlay.clearStreamingText()
-    }
-
-    private func processStreamingChunk() {
-        guard isPressed, !isStreamingInFlight else { return }
-
-        let currentSamples = recorder.currentSamples()
-        // Need at least 1 second of audio for meaningful transcription
-        guard currentSamples.count > 16000 else { return }
-
-        isStreamingInFlight = true
-
-        // T2.3 — remember the sample count this streaming pass runs over so finalizeRecording can
-        // measure how much the recording grew since (the reuse growth-gate).
-        let streamedSampleCount = currentSamples.count
-
-        let language = config.language
-
-        // Snapshot the transcriber on main BEFORE crossing into the async Task (mirrors the
-        // finalizeRecording fix). A mid-stream engine swap (reloadConfig) can replace
-        // self.transcriber; the snapshot guarantees this partial runs through the engine that
-        // was active when the chunk was captured, not a freshly-swapped one.
-        guard let transcriber = self.transcriber else {
-            isStreamingInFlight = false
-            return
-        }
-        let suppressRegex = transcriber.suppressAutoPunctuation ? "[,\\.\\?!;:\\-—]" : nil
-
-        let generation = streamingGeneration
-        // Bridge into async: streaming now routes through the Transcriber passthrough (no longer
-        // reaches into transcriber.engine.*). Engines serialize their own context internally.
-        Task { [weak self] in
-            guard let self = self else { return }
-            // Re-check: user may have released hotkey while we waited to start
-            guard self.isPressed else {
-                DispatchQueue.main.async { self.isStreamingInFlight = false }
-                return
-            }
-            do {
-                let partial = try await transcriber.transcribeStreaming(
-                    samples: currentSamples,
-                    language: language,
-                    prompt: nil,
-                    suppressRegex: suppressRegex,
-                    onPartialResult: { [weak self, generation] text in
-                        guard let self = self, self.streamingGeneration == generation else { return }
-                        // Strip Whisper hallucination markers so they don't appear in the
-                        // streaming overlay — the finalize path goes through TextPipeline,
-                        // but the preview path calls the engine directly.
-                        let cleaned = TextPipeline.stripWhisperBracketMarkers(text)
-                        let displayText = self.buildStableDisplayText(from: cleaned)
-                        self.recordingOverlay.updateStreamingText(displayText)
-                    }
-                )
-                DispatchQueue.main.async {
-                    // Commit completed sentences so they won't change on next inference.
-                    // Must run on main: streamingAssembler is main-queue-only state (it is
-                    // also mutated by onPartialResult and reset by stopStreamingTimer).
-                    let displayText = self.buildStableDisplayText(from: partial)
-                    self.recordingOverlay.updateStreamingText(displayText)
-                    self.isStreamingInFlight = false
-                    // T2.3 — record THIS completed pass (raw partial + samples it saw + when it
-                    // finished) so a fast key-release can reuse it instead of a fresh final pass.
-                    // Guard on generation: a stop that already bumped the generation must not have
-                    // its (now-stale) partial revived by a late-arriving completion.
-                    if self.streamingGeneration == generation {
-                        self.lastStreamingRawPartial = partial
-                        self.lastStreamingSampleCount = streamedSampleCount
-                        self.lastStreamingCompletedAt = CFAbsoluteTimeGetCurrent()
-                    }
-                }
-            } catch {
-                DiagnosticLogger.shared.log("Streaming: chunk failed — \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    self.isStreamingInFlight = false
-                }
-            }
-        }
-    }
-
-    /// Build stable display text: committed sentences are frozen, new content is appended.
-    /// Each sentence starts on a new line so existing lines don't reflow.
-    private func buildStableDisplayText(from rawText: String) -> String {
-        return streamingAssembler.append(rawText)
-    }
-
-    /// T2.3 — clear the saved last-streaming-pass state (called at streaming START so a new
-    /// recording can't reuse the previous recording's partial).
-    private func resetStreamingReuseState() {
-        lastStreamingRawPartial = ""
-        lastStreamingSampleCount = 0
-        lastStreamingCompletedAt = 0
-    }
-
     /// Background auto-recovery: transcribe each orphan serially, but only START one
     /// while the app is idle — the engines serialize inference, so a recovery chunk in
     /// flight would queue a live dictation behind it. Busy → poll again in 30s.
@@ -2590,7 +1547,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         var queue = urls
         func next() {
             guard let url = queue.first else { return }
-            let busy = isPressed || statusBar.state == .recording || statusBar.state == .transcribing
+            let busy = (session?.isRecording ?? false) || statusBar.state == .recording || statusBar.state == .transcribing
             if busy {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 30) { next() }
                 return
@@ -2780,122 +1737,5 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 return sizeA < sizeB
             })
             .map { String($0.dropFirst(5).dropLast(4)) }  // "ggml-base.en.bin" → "base.en"
-    }
-}
-
-/// R1: a generation-guarded holder for an off-main capture result.
-///
-/// `begin()` opens a new generation (invalidating any in-flight prior capture) and returns
-/// a token. The background reader calls `publish(_:token:)` when its work lands. The
-/// consumer calls `consume(waitingUpTo:)`, which returns the published value immediately if
-/// it has already arrived, or waits up to `timeout` for it — and returns `nil` on timeout,
-/// matching the old "AX query timed out → no context" behavior. `publish` is always called
-/// off the consumer's thread and signals a semaphore, so `consume` waiting on the consumer
-/// (main) thread can never deadlock. `reset()` puts the box into a published-nil state so a
-/// consume returns immediately with no value (used when a capture is skipped or invalidated).
-final class FocusCaptureBox<Value> {
-    private let lock = NSLock()
-    private var generation = 0
-    private var value: Value?
-    private var published = false
-    private var semaphore: DispatchSemaphore?
-    /// When the current generation was opened. A capture is only valid within
-    /// `captureDeadline` of this instant — see `publish`/`consume`.
-    private var beganAt: Date?
-    /// Start-relative validity window. Restores HEAD's "context is from record-START"
-    /// semantics: a result that only lands (or that a consumer would only wait for) more than
-    /// this long after `begin()` reflects mid-recording focus, not the focus at record-start,
-    /// so it is discarded rather than accepted.
-    private let captureDeadline: TimeInterval
-
-    init(captureDeadline: TimeInterval = 0.5) {
-        self.captureDeadline = captureDeadline
-    }
-
-    /// Open a new generation. Returns the token the background reader must pass to `publish`.
-    func begin() -> Int {
-        lock.lock(); defer { lock.unlock() }
-        generation += 1
-        value = nil
-        published = false
-        semaphore = DispatchSemaphore(value: 0)
-        beganAt = Date()
-        return generation
-    }
-
-    /// Publish the captured value. Dropped if `token` is stale (a newer `begin()`/`reset()`
-    /// ran), the current generation was already published, or the capture landed more than
-    /// `captureDeadline` after `begin()` (a late read reflects mid-recording, not record-start).
-    func publish(_ newValue: Value?, token: Int) {
-        lock.lock()
-        let tooLate = beganAt.map { Date().timeIntervalSince($0) > captureDeadline } ?? true
-        guard token == generation, !published, !tooLate else { lock.unlock(); return }
-        value = newValue
-        published = true
-        let sem = semaphore
-        lock.unlock()
-        sem?.signal()
-    }
-
-    /// Return the published value, waiting only until the start-relative deadline (and at most
-    /// `timeout`) if the capture is still in flight. Never blocks the caller beyond that; `nil`
-    /// on timeout (graceful degradation). Clears the stored value/element on return so the AX
-    /// element and cursor-adjacent text are never retained past a single consume (privacy).
-    func consume(waitingUpTo timeout: TimeInterval) -> Value? {
-        lock.lock()
-        if published { let v = value; value = nil; lock.unlock(); return v }
-        // If the capture can no longer legally publish (past its start-relative deadline),
-        // return immediately rather than blocking main on a result that will be rejected. This
-        // also kills the between-dictations 0.5s block when no capture is in flight for this gen.
-        let remaining: TimeInterval = beganAt.map { captureDeadline - Date().timeIntervalSince($0) } ?? 0
-        if remaining <= 0 { let v = value; value = nil; lock.unlock(); return v }
-        let sem = semaphore
-        lock.unlock()
-        _ = sem?.wait(timeout: .now() + min(timeout, remaining))
-        lock.lock(); let v = value; value = nil; lock.unlock()
-        return v
-    }
-
-    /// Invalidate any in-flight capture and put the box into a published-nil state so the
-    /// next `consume` returns `nil` immediately (no wait).
-    func reset() {
-        lock.lock()
-        generation += 1
-        value = nil
-        published = true
-        semaphore = nil
-        beganAt = nil
-        lock.unlock()
-    }
-}
-
-// MARK: - Local API dictation driver
-
-/// Drives the SAME start/stop/abort path as the hotkey, so an API dictation gets the pre-buffer,
-/// post-buffer, gates, pipeline, overlay, and recordings retention exactly like a key press.
-extension AppDelegate: DictationDriver {
-    var isDictating: Bool { isPressed || postBufferTimer != nil }
-
-    var inputLevel: Float { recorder?.currentLevel ?? 0 }
-
-    func startAPIDictation(sessionID: UUID, destination: DictationAPIDestination) -> String? {
-        guard isReady, !isTerminating else { return "speakfree is not ready" }
-        guard !isDictating else { return "A dictation is already in progress" }
-        pendingAPISession = (sessionID, destination)
-        handleRecordingStart()
-        if isPressed { return nil }
-        // handleRecordingStart returned without recording (microphone permission, or a start
-        // failure it already reported). Clear the session so it cannot leak into the next take.
-        pendingAPISession = nil
-        return "Recording did not start (check microphone permission)"
-    }
-
-    func stopAPIDictation() {
-        handleRecordingStop()
-        performPendingConfigReloadIfNeeded()
-    }
-
-    func cancelAPIDictation() {
-        handleRecordingAbort()
     }
 }

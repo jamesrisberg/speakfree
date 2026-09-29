@@ -11,7 +11,7 @@
 // This file is the PURE decision: "given the RMS of each fixed-length window of trailing audio,
 // how long should I keep recording before finalizing?" It has no I/O, no audio framework, no clock
 // — just arithmetic over `[Float]` window-RMS values — so it is exhaustively unit-testable
-// (silence-immediately / speech-until-release / speech-past-release). AppDelegate drives it by
+// (silence-immediately / speech-until-release / speech-past-release). DictationSession drives it by
 // chopping the post-release audio into windows and polling `decideWaitMs`; the perf harness drives
 // it over fixture tails to measure the latency win.
 //
@@ -68,7 +68,7 @@ public enum PostBufferPolicy {
     /// Default poll/window cadence (ms). The live runtime polls the recorder at this grain.
     public static let defaultWindowMs: Double = 30.0
 
-    /// Default RMS silence threshold. Chosen well above the dead-audio floor (AppDelegate uses
+    /// Default RMS silence threshold. Chosen well above the dead-audio floor (FinalizePipeline uses
     /// 0.0001 to detect a *dead engine*) but below normal speech energy (the visualizer treats
     /// ~0.15 RMS as full-scale). 0.01 ≈ −40 dBFS: room tone / breath passes as silence, an actual
     /// trailing syllable does not. The rule is `≤`: a window AT the threshold counts as silence.

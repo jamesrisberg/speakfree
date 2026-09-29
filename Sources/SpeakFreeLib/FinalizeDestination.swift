@@ -1,12 +1,12 @@
 import Foundation
 
-/// Where a finalized dictation's text goes (C1). Today's only destination is `insertImmediately` —
-/// the pipeline text is composed and handed to the TextInserter. Edit Mode adds
-/// `returnToEditSession`: the finalized segment is delivered to the open edit session and is
-/// STRUCTURALLY unable to reach the inserter (see AppDelegate.finalizeRecording, where the
-/// destinations are mutually-exclusive branches — only insertImmediately calls presentFinalizedText).
-/// The local API adds `returnToCaller`: a dictation started over HTTP with
-/// `"destination": "caller"` hands its text back to the API client and never types at the cursor.
+/// Where a finalized dictation's text goes (C1). `insertImmediately`: the pipeline text is
+/// composed and handed to the TextInserter. `returnToEditSession`: the finalized segment is
+/// delivered to the open edit session and is STRUCTURALLY unable to reach the inserter (see
+/// DictationSession.finalizeRecording, where the destinations are mutually-exclusive branches —
+/// only insertImmediately calls deliverAtCursor). `returnToCaller`: a take whose destination is
+/// `.caller` (a local API dictation with `"destination": "caller"`, or any host that asked for the
+/// text back) returns its text and never types at the cursor.
 ///
 /// The captured target for an edit session is immutable for the session's life: segments 2+ do NOT
 /// re-run focus capture. That is why the destination is decided from a target token captured when
@@ -16,7 +16,7 @@ public enum FinalizeDestination: Equatable {
     case returnToEditSession(sessionID: UUID, segmentID: UUID)
     case returnToCaller(sessionID: UUID)
 
-    /// Pure resolution so the routing rule is unit-testable without an AppKit AppDelegate. A segment
+    /// Pure resolution so the routing rule is unit-testable without a live session. A segment
     /// belongs to an edit session iff a target was captured for it at record-start (nil for every
     /// hold/toggle dictation — those insert immediately, byte-identically to before Edit Mode).
     ///

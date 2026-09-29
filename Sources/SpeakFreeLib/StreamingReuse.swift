@@ -10,7 +10,7 @@
 // short utterances.
 //
 // This type is the PURE decision: it owns no app state, touches no engine, and is unit-testable
-// headless. `AppDelegate.finalizeRecording` snapshots the live numbers and asks `decide(...)`.
+// headless. `DictationSession.finalizeRecording` snapshots the live numbers and asks `decide(...)`.
 //
 // ACCURACY CAVEAT (AR-2 findings #1, #2): the streaming partial is computed with `prompt: nil` and
 // NO VAD trim, whereas the final pass it replaces is glossary/cursor/screen-context-PRIMED, VAD-
