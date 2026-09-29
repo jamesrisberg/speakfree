@@ -1268,6 +1268,12 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         statusBar.buildMenu()
     }
 
+    /// Test-only bridge — exercises the failure-presentation path without a live
+    /// DictationSession. Not called by production code.
+    func presentFailureForTesting(_ failure: DictationFailure) {
+        presentFailure(failure)
+    }
+
     /// Present one session event: menu-bar state, the recording overlay, alerts.
     private func present(_ event: DictationEvent) {
         switch event {
@@ -1396,8 +1402,6 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             }
             recordingOverlay.show(state: .error("Capture failed: please try again"))
             showCaptureFailureAlert()
-            statusBar.state = .idle
-            recordingOverlay.hide()
         case .silent:
             // The user held the key and spoke into a dead mic — say so (F12:
             // gate failures were a silent no-op; the empty-transcript fix
@@ -1524,12 +1528,21 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Shows a blocking NSAlert describing the capture failure.
+    /// Separated from `showCaptureFailureAlert` so it can be replaced by a seam in
+    /// tests (mirrors `_alertPresenter` for setup failures).
+    var _captureFailureAlertPresenter: (() -> Void)?
+
     private func showCaptureFailureAlert() {
         let now = Date()
         guard lastTranscriptionFailureAlert.map({ now.timeIntervalSince($0) > 300 }) ?? true else {
             return
         }
         lastTranscriptionFailureAlert = now
+        if let presenter = _captureFailureAlertPresenter {
+            presenter()
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Capture Failed"
