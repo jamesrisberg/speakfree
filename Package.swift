@@ -36,7 +36,6 @@ let package = Package(
         .target(
             name: "SpeakFreeLib",
             dependencies: [
-                "Sparkle",
                 "CWhisper",
                 "CTryCatch",
                 .product(name: "FluidAudio", package: "FluidAudio"),
@@ -50,7 +49,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "speakfree",
-            dependencies: ["SpeakFreeLib"],
+            dependencies: [
+                "SpeakFreeLib",
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
             path: "Sources/SpeakFree"
         ),
         // Performance-regression harness (T2.0): benchmarks per-fixture inference time +
