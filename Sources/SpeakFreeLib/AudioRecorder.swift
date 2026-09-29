@@ -61,6 +61,10 @@ public class AudioRecorder {
         if !monitorsStarted {
             monitorsStarted = true
             AudioDeviceCatalog.onDeviceListChanged = { [weak self] _, devices in self?.handleDeviceListChanged(devices) }
+            // Routing reads the catalog's cache, which is empty until the catalog starts. A host
+            // embedding the recorder without AppDelegate would otherwise route its first take to
+            // no device; the first refresh reports the device list and re-routes.
+            AudioDeviceCatalog.startCache()
             observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 self.capture.queue.async { self.preroll = [] }
