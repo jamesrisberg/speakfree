@@ -29,4 +29,17 @@ final class EditKeyReducerTests: XCTestCase {
         XCTAssertEqual(FinalizeDestination.resolve(editTarget: (sessionID: sid, segmentID: segid)),
                        .returnToEditSession(sessionID: sid, segmentID: segid))
     }
+
+    func testCallerSessionReturnsToCaller() {
+        let id = UUID()
+        XCTAssertEqual(FinalizeDestination.resolve(editTarget: nil, callerSession: id),
+                       .returnToCaller(sessionID: id))
+    }
+
+    func testEditTargetWinsOverCallerSession() {
+        let sid = UUID(), segid = UUID()
+        XCTAssertEqual(FinalizeDestination.resolve(editTarget: (sessionID: sid, segmentID: segid),
+                                                   callerSession: UUID()),
+                       .returnToEditSession(sessionID: sid, segmentID: segid))
+    }
 }

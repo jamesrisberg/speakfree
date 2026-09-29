@@ -38,6 +38,18 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     var pendingEditFinalizeTarget: (sessionID: UUID, segmentID: UUID)?
     /// Delivers a finalized edit segment to the open session INSTEAD of inserting it (C1).
     var editFinalizeSink: ((EditFinalizePayload) -> Void)?
+    // MARK: - Local API dictation control
+    //
+    /// The local-API session this take belongs to (nil for hotkey dictations). Set at record-start
+    /// by `startAPIDictation`, snapshotted and cleared in finalizeRecording / abort. A `.caller`
+    /// destination resolves to FinalizeDestination.returnToCaller and never reaches the inserter.
+    var pendingAPISession: (id: UUID, destination: DictationAPIDestination)?
+    /// Session registry + /v1/events fan-out. Every dictation reports its progress here.
+    private(set) lazy var dictationControl: DictationControlCenter = {
+        let center = DictationControlCenter()
+        center.driver = self
+        return center
+    }()
     /// True while an edit session window is open — extends the config-reload defer (MAP §8).
     var editSessionOpenProbe: (() -> Bool)?
     /// Routes an Edit-mode fn-tap through the EditSessionController (Phase 2). nil = fall back to
@@ -760,7 +772,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The engine id ("whisper" | "parakeet") of the currently-built transcriber. Tracked here
     /// so reloadConfig can detect an engine switch without reaching into transcriber.engine.*.
-    private var activeEngineID: String = "whisper"
+    private(set) var activeEngineID: String = "whisper"
 
     /// True once setupInner() has run to completion (hotkey listener started).
     /// While false, the app is in the "no model" state and reloadConfig triggers a full restart.
@@ -1669,6 +1681,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Start streaming transcription timer — processes audio every 2s for live preview
             startStreamingTimer()
+            dictationControl.pipelineDidStartRecording(sessionID: pendingAPISession?.id)
         } catch {
             // MUST be visible in the diagnostic log: this branch used to print only to
             // stdout, so the 2026-07-23 every-press-fails outage looked like a silent
@@ -1693,6 +1706,9 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             // hide — the user pressed the key, spoke, and got nothing. Now a red
             // center-screen banner says so (auto-hides).
             recordingOverlay.show(state: .error("Recording failed: check your microphone"))
+            dictationControl.pipelineDidFail(sessionID: pendingAPISession?.id,
+                                             message: "Recording failed: check your microphone")
+            pendingAPISession = nil
         }
     }
 
@@ -1782,6 +1798,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         screenContextText = nil
         screenCaptureGeneration = UUID()  // invalidate any in-flight OCR
         resetRecordingUIAfterAbort()
+        dictationControl.pipelineDidCancel(sessionID: pendingAPISession?.id)
+        pendingAPISession = nil
 
         // L1: the dictation ended (aborted) — apply any config reload deferred while fn was held.
         performPendingConfigReloadIfNeeded()
@@ -1934,6 +1952,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         performPendingConfigReloadIfNeeded()
 
         let stopTime = keyReleaseTime
+        // Local-API session for this take (nil for hotkey dictations), captured before any exit.
+        let apiSession = pendingAPISession
+        pendingAPISession = nil
+        let apiSessionID = apiSession?.id
+        let callerSession = apiSession?.destination == .caller ? apiSession?.id : nil
 
         guard let recording = recorder.stopRecording() else {
             if let activityLease {
@@ -1942,6 +1965,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             focusCapture.reset()
             statusBar.state = .idle
             recordingOverlay.hide()
+            dictationControl.pipelineDidFail(sessionID: apiSessionID, message: "No audio was captured")
             return
         }
         let audioURL = recording.url
@@ -2036,6 +2060,14 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 statusBar.state = .idle
                 recordingOverlay.hide()
             }
+            let gateMessage: String
+            switch failure {
+            case .tooShort: gateMessage = "Recording too short"
+            case .silent: gateMessage = "No speech captured"
+            case .captureFailed: gateMessage = "Capture failed"
+            default: gateMessage = "Recording rejected"
+            }
+            dictationControl.pipelineDidFail(sessionID: apiSessionID, message: gateMessage)
             return
         }
         if gate.usedWavFallback {
@@ -2048,6 +2080,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusBar.state = .transcribing
         recordingOverlay.update(state: .transcribing)
+        dictationControl.pipelineDidBeginTranscribing(sessionID: apiSessionID)
 
         // R1: consume the off-main focus capture. In the normal case it published while the
         // user was still speaking, so this returns immediately; only if the AX read is still
@@ -2104,6 +2137,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             RecordingStore.clearSentinel(recordingURL: audioURL)
             statusBar.state = .idle
             recordingOverlay.hide()
+            dictationControl.pipelineDidFail(sessionID: apiSessionID, message: "Transcription engine not ready")
             return
         }
 
@@ -2183,9 +2217,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                     DiagnosticLogger.shared.log(
                         "T2.3: reused last streaming partial (skipped final inference)")
                 }
-                let text = TextPipeline.run(
+                let pipelineResult = TextPipeline.run(
                     makeInput(primaryRaw, samples.count),
-                    precomputedPrompt: .some(prompt)).finalText
+                    precomputedPrompt: .some(prompt))
+                let text = pipelineResult.finalText
                 let meta = RecordingStore.RecordingMeta(
                     appVersion: SpeakFree.version,
                     engine: metaEngine,
@@ -2209,7 +2244,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 // C1 finalize destination: hold/toggle insert immediately (today's path, unchanged);
                 // an edit segment is delivered to its session and CANNOT reach the inserter.
-                switch FinalizeDestination.resolve(editTarget: editTarget) {
+                switch FinalizeDestination.resolve(editTarget: editTarget, callerSession: callerSession) {
                 case .returnToEditSession(let sessionID, let segmentID):
                     let payload = EditFinalizePayload(
                         sessionID: sessionID, segmentID: segmentID, raw: primaryRaw,
@@ -2219,6 +2254,21 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                         // owns the segment from here.
                         self.statusBar.state = .idle
                         self.editFinalizeSink?(payload)
+                        self.dictationControl.pipelineDidFinish(sessionID: nil, result: nil)
+                    }
+                case .returnToCaller(let sessionID):
+                    let payload = CallerFinalizePayload(
+                        sessionID: sessionID, raw: primaryRaw,
+                        processed: pipelineResult.processedText, styled: text)
+                    DispatchQueue.main.async {
+                        // No presentFinalizedText, no TextInserter: the text goes back over the
+                        // local API and never reaches the focused app.
+                        if keepRecording {
+                            self.statusBar.noteFinishedRecording(url: audioURL, text: text)
+                        }
+                        self.statusBar.state = .idle
+                        self.recordingOverlay.hide()
+                        self.dictationControl.pipelineDidFinish(sessionID: sessionID, result: payload)
                     }
                 case .insertImmediately:
                     DispatchQueue.main.async {
@@ -2233,6 +2283,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                             contextBefore: capturedInputText,
                             element: capturedElement
                         )
+                        self.dictationControl.pipelineDidFinish(sessionID: apiSessionID, result: nil)
                     }
                 }
             } catch {
@@ -2261,6 +2312,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 DispatchQueue.main.async {
                     self.recordingOverlay.hide()
+                    // Report before any modal below: an API caller must not wait on an alert.
+                    self.dictationControl.pipelineDidFail(
+                        sessionID: apiSessionID,
+                        message: isModelMissing ? "Model not downloaded" : "Transcription failed")
                     if isModelMissing {
                         let message = "Parakeet model not downloaded — open Settings to download."
                         print("Error: \(message)")
@@ -2809,5 +2864,36 @@ final class FocusCaptureBox<Value> {
         semaphore = nil
         beganAt = nil
         lock.unlock()
+    }
+}
+
+// MARK: - Local API dictation driver
+
+/// Drives the SAME start/stop/abort path as the hotkey, so an API dictation gets the pre-buffer,
+/// post-buffer, gates, pipeline, overlay, and recordings retention exactly like a key press.
+extension AppDelegate: DictationDriver {
+    var isDictating: Bool { isPressed || postBufferTimer != nil }
+
+    var inputLevel: Float { recorder?.currentLevel ?? 0 }
+
+    func startAPIDictation(sessionID: UUID, destination: DictationAPIDestination) -> String? {
+        guard isReady, !isTerminating else { return "speakfree is not ready" }
+        guard !isDictating else { return "A dictation is already in progress" }
+        pendingAPISession = (sessionID, destination)
+        handleRecordingStart()
+        if isPressed { return nil }
+        // handleRecordingStart returned without recording (microphone permission, or a start
+        // failure it already reported). Clear the session so it cannot leak into the next take.
+        pendingAPISession = nil
+        return "Recording did not start (check microphone permission)"
+    }
+
+    func stopAPIDictation() {
+        handleRecordingStop()
+        performPendingConfigReloadIfNeeded()
+    }
+
+    func cancelAPIDictation() {
+        handleRecordingAbort()
     }
 }
