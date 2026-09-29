@@ -49,7 +49,9 @@ esac
 # (libwhisper 1.8.3 + ggml 0.9.5) avoids depending on transient brew state —
 # specifically, brew's whisper-cpp 1.8.4 is ABI-incompatible with current ggml
 # 0.10.0, so building against brew silently produces a binary that ggml_aborts
-# at model load. See scripts/vendor/dylibs/README.md.
+# at model load. See scripts/vendor/dylibs/README.md. The speakfree binary itself links
+# the same pair statically from scripts/vendor/whisper.xcframework; these dylibs serve
+# the bundled whisper-cli fallback.
 VENDOR_DIR="$(dirname "$0")/vendor/dylibs"
 
 # Stamp EVERY mechanical version surface in the Pages site from VERSION, up front,
@@ -112,7 +114,8 @@ echo "Verifying vendored dylib checksums..."
 # To regenerate after an intentional vendor update:
 #   cd scripts/vendor/dylibs && shasum -a 256 *.dylib whisper-cli > checksums.sha256
 (cd "$VENDOR_DIR" && shasum -a 256 -c checksums.sha256 --strict)
-echo "Vendored dylib checksums OK."
+(cd "$VENDOR_DIR/.." && shasum -a 256 -c whisper.xcframework.sha256 --strict)
+echo "Vendored dylib and whisper.xcframework checksums OK."
 
 echo "Bundling whisper-cli..."
 mkdir -p "$APP/Contents/Frameworks"
@@ -152,20 +155,13 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" \
 install_name_tool -add_rpath "@executable_path/../Frameworks" \
     "$APP/Contents/MacOS/whisper-cli" 2>/dev/null || true
 
-# Re-point the speakfree binary's libwhisper reference to @rpath. Swift Package
-# Manager links it against the dylib's LC_ID_DYLIB (an absolute brew path), so
-# without this fixup the running binary loads brew's libwhisper at runtime
-# instead of the bundled one, defeating the whole pinning scheme.
+# Guard: whisper.cpp is linked statically, so the speakfree binary must not load any
+# whisper/ggml dylib or anything from Homebrew at runtime.
 SPEAKFREE_BIN="$APP/Contents/MacOS/speakfree"
-ORIG_WHISPER_REF=$(otool -L "$SPEAKFREE_BIN" | awk '/libwhisper\.1\.dylib/ {print $1; exit}')
-if [ -n "$ORIG_WHISPER_REF" ] && [ "$ORIG_WHISPER_REF" != "@rpath/libwhisper.1.dylib" ]; then
-    install_name_tool -change "$ORIG_WHISPER_REF" "@rpath/libwhisper.1.dylib" "$SPEAKFREE_BIN"
-fi
-# Guard: verify the rpath fix took — if it still points to brew, the DMG would ship
-# a binary that loads brew's libwhisper at runtime and crashes on model load.
-FINAL_WHISPER_REF=$(otool -L "$SPEAKFREE_BIN" | awk '/libwhisper\.1\.dylib/ {print $1; exit}')
-if [ "$FINAL_WHISPER_REF" != "@rpath/libwhisper.1.dylib" ]; then
-    echo "FATAL: libwhisper still points to '$FINAL_WHISPER_REF' — rpath fix failed. Aborting." >&2
+SPEAKFREE_LINKS=$(otool -L "$SPEAKFREE_BIN" | tail -n +2)
+if grep -Eq 'libwhisper|libggml|/opt/homebrew|/usr/local/' <<< "$SPEAKFREE_LINKS"; then
+    echo "FATAL: speakfree links a whisper/ggml or Homebrew dylib:" >&2
+    echo "$SPEAKFREE_LINKS" >&2
     exit 1
 fi
 

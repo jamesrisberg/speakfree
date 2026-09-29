@@ -110,12 +110,11 @@ speakfree runs entirely on your Mac.
 
 ## Build from source
 
-Apple Silicon only — `Package.swift` links whisper-cpp from the Apple-Silicon Homebrew prefix (`/opt/homebrew`), so Intel Macs cannot build this project.
+Apple Silicon only — whisper.cpp is linked from `scripts/vendor/whisper.xcframework`, a static arm64 build (see `scripts/vendor/build-whisper-xcframework.sh`), so Intel Macs cannot build this project.
 
 ```bash
 git clone https://github.com/definitelyreal/speakfree.git
 cd speakfree
-brew install whisper-cpp
 swift build -c release
 bash scripts/bundle-app.sh .build/release/speakfree speakfree.app dev
 open speakfree.app

@@ -32,9 +32,9 @@ Correct sequence when installing a fresh build to `/Applications` (or `~/Applica
 
 - **Fleet rule (Michael, 2026-07-22): every dev redeploy goes to ALL THREE Macs** — M3 (this machine), M5 (`movie@STUDIO_TAILSCALE_HOST`), M1 (`ark` in ~/.ssh/config). Use `bash scripts/dev-deploy-fleet.sh` (builds, bundles, installs locally, ships vendored bundles to the remotes with the trash-then-copy sequence).
 - Release build: `swift build -c release` (or `xcrun swift build -c release`).
-- Bundle: `bash scripts/bundle-app.sh .build/release/speakfree speakfree.app dev` — this dev bundle links `libwhisper` from Homebrew (`/opt/homebrew/opt/whisper-cpp`), so alone it only runs on a machine with `whisper-cpp` installed (the M3). For the M5/M1, which have no Homebrew whisper-cpp, `dev-deploy-fleet.sh` vendors `scripts/vendor/dylibs` into the bundle (soname symlinks + `@rpath` install-name fix, re-signed). The signed release `.dmg` (via `scripts/build.sh`) bundles the dylib the same way.
+- Bundle: `bash scripts/bundle-app.sh .build/release/speakfree speakfree.app dev`. whisper.cpp 1.8.3 + ggml 0.9.5 are linked statically from `scripts/vendor/whisper.xcframework` (rebuilt by `scripts/vendor/build-whisper-xcframework.sh`), so the bundle runs on any Apple silicon Mac without Homebrew. The signed release `.dmg` (via `scripts/build.sh`) additionally bundles `whisper-cli` and the `scripts/vendor/dylibs` it loads, for the CLI fallback.
 - The dev bundle is ad-hoc signed (version "dev"): first launch needs **right-click → Open**, and TCC permissions (Mic/Accessibility) may need re-granting after each rebuild.
-- To run the CLI build directly: `export DYLD_FALLBACK_LIBRARY_PATH=$PWD/scripts/vendor/dylibs` then `./.build/debug/speakfree <cmd>`.
+- To run the CLI build directly: `./.build/debug/speakfree <cmd>`.
 
 ## Menu-bar title must reflect build/mode (MANDATORY)
 

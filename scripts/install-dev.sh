@@ -6,10 +6,8 @@
 # mandatory trash-then-copy policy: NEVER mutate the installed bundle in place —
 # that leaves stale files and corrupts TCC (Microphone/Accessibility) state.
 #
-# Dev bundles resolve libwhisper from Homebrew's absolute path (no rpath rewrite,
-# no bundled dylib) — see scripts/bundle-app.sh. Do not re-point it to @rpath here;
-# the dev bundle never ships a Frameworks/libwhisper*.dylib for @rpath to resolve,
-# so doing so previously broke dyld at launch.
+# The speakfree binary links whisper.cpp statically (scripts/vendor/whisper.xcframework),
+# so the dev bundle needs no whisper dylib and no rpath rewrite.
 set -e
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"

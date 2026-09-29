@@ -11,7 +11,7 @@ mkdir -p "$APP_DIR/Contents/Resources"
 
 cp "$BINARY" "$APP_DIR/Contents/MacOS/speakfree"
 # swift build doesn't set @executable_path/../Frameworks rpath — add it so
-# bundled frameworks (Sparkle, whisper dylibs) are found at runtime.
+# bundled frameworks (Sparkle) are found at runtime. whisper.cpp is linked statically.
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_DIR/Contents/MacOS/speakfree" 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -80,7 +80,7 @@ PLIST
 # honoring a stale row while the real app had nothing). A Developer ID signature
 # has a stable designated requirement, so grants survive rebuilds.
 # Deliberately NOT --options runtime: hardened-runtime library validation would
-# reject the Homebrew libwhisper dylib and Sparkle.framework in dev bundles.
+# reject Sparkle.framework in dev bundles.
 DEV_ID=$(security find-identity -v -p codesigning 2>/dev/null \
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
 if [ -n "$DEV_ID" ]; then
