@@ -43,6 +43,7 @@ SpeakFree on its own or only to a host that embeds SpeakFree.
 | Public `HotkeyManager` API | `b190a19` | A host can drive the fn key and gestures itself. |
 | Sparkle moved out of the library | `88d4f12` | `AppUpdater` protocol in `SpeakFreeLib`; the Sparkle implementation lives in the `speakfree` app target, so hosts don't link Sparkle. The app behaves as before. |
 | Host-supplied retention | `288bffa` | `DictationSession(recorder:inserter:retentionConfig:)` lets a host decide what finished takes keep (for example, nothing). |
+| Recorder starts the device catalog | `97c839e` | `AudioRecorder.warmUp()` starts `AudioDeviceCatalog`'s cache (`startCache()` is now idempotent). Without `AppDelegate` the cache stayed empty, so a host's first take was routed to no device and failed with "Capture failed". |
 
 None of the changes are fork-only in the sense of being wrong for upstream; the host-facing ones
 simply matter less to an app that is never embedded.
