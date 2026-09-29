@@ -246,4 +246,66 @@ public enum RecordingOverlayPreview {
         print("overlay-preview: style \(style) on screen (inert) — Ctrl-C or close to quit")
         app.run()
     }
+
+    /// `speakfree overlay-preview <center|bottom|notch|hidden> [screen]` — drive the
+    /// REAL overlay window (not a bare content view) through record → transcribe →
+    /// status → hide → error at the given placement, with simulated speech. On the
+    /// screen under the mouse unless a screen index (from the printed list) is given.
+    /// Nothing touches the mic or config. Loops until quit.
+    public static func runPlacement(_ placement: OverlayPlacement, screenIndex: Int? = nil) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let overlay = RecordingOverlay()
+        overlay.style = 5
+        overlay.placement = placement
+
+        let screens = NSScreen.screens
+        for (i, screen) in screens.enumerated() {
+            let g = OverlayScreenGeometry(screen: screen)
+            let notch = g.hasNotch ? " notch \(Int(g.notchWidth ?? 0))×\(Int(g.notchInset))pt" : ""
+            let main = screen === NSScreen.main ? " (main)" : ""
+            print("screen \(i): \(Int(screen.frame.width))×\(Int(screen.frame.height))\(main)\(notch)")
+        }
+        if let index = screenIndex {
+            guard screens.indices.contains(index) else {
+                print("overlay-preview: no screen \(index)")
+                exit(1)
+            }
+            // Pin the pick: no focused-window lookup, and "the mouse" is that screen's center.
+            let center = NSPoint(x: screens[index].frame.midX, y: screens[index].frame.midY)
+            overlay.windowFrameProvider = { nil }
+            overlay.mouseLocationProvider = { center }
+        }
+        var sim = PreviewSpeechSimulator()
+        overlay.previewLevelProvider = { sim.level }
+
+        // (delay since the previous step, action)
+        let script: [(TimeInterval, () -> Void)] = [
+            (0.0, { sim.reset(); overlay.show(state: .recording) }),
+            (3.5, { overlay.update(state: .transcribing) }),
+            (1.5, { overlay.updateStreamingText("Rechecking with whisper\u{2026}") }),
+            (1.5, { overlay.hide() }),
+            (1.0, { overlay.show(state: .error("Recording failed: check your microphone")) }),
+            (3.5, { overlay.hide() }),
+        ]
+        var step = 0
+        func advance() {
+            let (delay, action) = script[step]
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                action()
+                step = (step + 1) % script.count
+                advance()
+            }
+        }
+        advance()
+
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { _ in
+            sim.advance(1000.0 / 30.0)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+
+        print("overlay-preview: placement \(placement.rawValue) — real overlay window, mic untouched — Ctrl-C to quit")
+        app.run()
+    }
 }
