@@ -530,4 +530,101 @@ final class LocalAPIServerLiveTests: XCTestCase {
         XCTAssertEqual(status2.trimmingCharacters(in: .whitespaces), "400",
                        "Authenticated request should pass the auth gate (then 400 missing file), got \(status2)")
     }
+
+    // MARK: - Dictation control (live socket, stubbed recording pipeline)
+
+    /// Run curl WITHOUT blocking the main thread: the control endpoints hop to main, so a
+    /// synchronous `shell` here would deadlock until curl timed out.
+    private func curlAsync(_ args: [String], done: @escaping (String) -> Void) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        proc.terminationHandler = { _ in
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            DispatchQueue.main.async { done(String(data: data, encoding: .utf8) ?? "") }
+        }
+        do { try proc.run() } catch { done("LAUNCH FAILED: \(error)") }
+    }
+
+    /// Full round trip over a real socket: /v1/events streams the lifecycle, start returns a session
+    /// id, stop long-polls until the (stubbed) pipeline finishes and returns the caller's text.
+    func testLiveControlCallerRoundTripWithEventStream() throws {
+        try skipIfDisabled()
+        let center = DictationControlCenter()
+        let driver = DictationControlTests.StubDriver()
+        driver.center = center
+        center.driver = driver
+        let t = makeTranscriber()
+        transcriber = t
+        let s = LocalAPIServer(port: Self.livePort)
+        s.start(transcriber: t, allowControl: true, control: center)
+        server = s
+        let base = "http://127.0.0.1:\(Self.livePort)"
+
+        let eventsDone = expectation(description: "events stream")
+        var events = ""
+        // Give the listener a moment, then open the stream for ~1.5 s.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            self.curlAsync(["-s", "-N", "--max-time", "1.5", "\(base)/v1/events"]) {
+                events = $0; eventsDone.fulfill()
+            }
+        }
+
+        let stopped = expectation(description: "stop returns text")
+        var stopBody = ""
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            self.curlAsync(["-s", "--max-time", "3", "-X", "POST", "-d", #"{"destination":"caller"}"#,
+                            "\(base)/v1/dictation/start"]) { startBody in
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(startBody.utf8)) as? [String: Any],
+                      let idString = obj["id"] as? String, let id = UUID(uuidString: idString) else {
+                    XCTFail("start did not return a session id: \(startBody)"); stopped.fulfill(); return
+                }
+                XCTAssertEqual(obj["state"] as? String, "recording")
+                self.curlAsync(["-s", "--max-time", "3", "-X", "POST", "\(base)/v1/dictation/\(idString)/stop"]) {
+                    stopBody = $0; stopped.fulfill()
+                }
+                // The long-poll is parked until the pipeline reports; finish the take shortly after.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    center.pipelineDidFinish(sessionID: id, result: CallerFinalizePayload(
+                        sessionID: id, raw: "hello from the api", processed: "hello from the api",
+                        styled: "Hello from the API."))
+                }
+            }
+        }
+
+        wait(for: [stopped, eventsDone], timeout: 8)
+        print("PROOF[control] stop => \(stopBody)\nPROOF[control] events =>\n\(events)")
+        let stopObj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(stopBody.utf8)) as? [String: Any])
+        XCTAssertEqual(stopObj["state"] as? String, "done")
+        XCTAssertEqual(stopObj["styled"] as? String, "Hello from the API.")
+        XCTAssertEqual(stopObj["raw"] as? String, "hello from the api")
+
+        let order = ["\"state\":\"idle\"", "\"state\":\"recording\"", "\"state\":\"transcribing\"",
+                     "\"state\":\"done\""]
+        var cursor = events.startIndex
+        for needle in order {
+            guard let r = events.range(of: needle, range: cursor..<events.endIndex) else {
+                XCTFail("missing \(needle) in order; stream was:\n\(events)"); break
+            }
+            cursor = r.upperBound
+        }
+        XCTAssertTrue(events.contains("event: state\ndata: "), "SSE framing")
+        XCTAssertFalse(events.contains("Hello from the API"), "events must not carry transcript text")
+    }
+
+    func testLiveControlDisabledAnswers403() throws {
+        try skipIfDisabled()
+        startServer()
+        let exp = expectation(description: "403")
+        var status = ""
+        curlAsync(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3",
+                   "-X", "POST", "http://127.0.0.1:\(Self.livePort)/v1/dictation/start"]) {
+            status = $0; exp.fulfill()
+        }
+        wait(for: [exp], timeout: 5)
+        XCTAssertEqual(status.trimmingCharacters(in: .whitespaces), "403")
+    }
 }

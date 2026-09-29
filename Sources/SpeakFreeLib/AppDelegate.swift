@@ -1168,7 +1168,9 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             }
             localAPIServer?.start(transcriber: t,
                                   allowBrowser: config.localAPIAllowBrowser?.value ?? false,
-                                  authToken: config.localAPIToken)
+                                  authToken: config.localAPIToken,
+                                  allowControl: config.localAPIAllowControl?.value ?? false,
+                                  control: dictationControl)
         } else {
             localAPIServer?.stop()
             localAPIServer = nil

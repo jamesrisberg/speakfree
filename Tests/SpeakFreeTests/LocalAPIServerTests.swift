@@ -412,7 +412,7 @@ extension LocalAPIServer.RequestOutcome {
     var statusForTest: Int {
         switch self {
         case .respond(let status, _, _): return status
-        case .transcribe: return 200
+        case .transcribe, .control: return 200
         }
     }
 }
